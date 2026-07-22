@@ -1,0 +1,60 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Only needed for the `snapcrafts` section of .goreleaser.yaml. Skipped
+      # automatically below until SNAPCRAFT_STORE_CREDENTIALS is set.
+      - name: Install snapcraft
+        if: ${{ env.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        run: sudo snap install snapcraft --classic
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+
+      # Skip pipelines whose one-time manual setup (see README) hasn't
+      # happened yet, instead of failing the whole release on a missing
+      # secret. Once both secrets exist below, this naturally builds the
+      # full skip list as empty.
+      - name: Compute --skip flags
+        id: skip
+        run: |
+          skip=()
+          [ -z "$HOMEBREW_TAP_GITHUB_TOKEN" ] && skip+=("homebrew")
+          [ -z "$SNAPCRAFT_STORE_CREDENTIALS" ] && skip+=("snapcraft")
+          IFS=,; echo "flags=${skip[*]}" >> "$GITHUB_OUTPUT"
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean ${{ steps.skip.outputs.flags != '' && format('--skip={0}', steps.skip.outputs.flags) || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with `repo` scope on github.com/NotTesfamichael/homebrew-tiru-emba.
+          # The default GITHUB_TOKEN above can only write to *this* repo.
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          # From `snapcraft export-login` — see README for the one-time setup.
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
