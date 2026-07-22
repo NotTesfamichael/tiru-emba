@@ -8,11 +8,13 @@ import (
 	"path/filepath"
 )
 
-// DirName is the folder created under the user's home directory.
-const DirName = "Tiru_File"
+// DirName is the folder under the user's home directory that accepted file
+// transfers are saved into -- the same place browsers save downloads to, so
+// it's already familiar and already exists on virtually every machine.
+const DirName = "Downloads"
 
-// Dir returns the absolute path to ~/Tiru_File, creating it if needed so
-// every install has it ready before any transfer arrives.
+// Dir returns the absolute path to ~/Downloads, creating it if it somehow
+// doesn't already exist.
 func Dir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
