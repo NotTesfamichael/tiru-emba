@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
+	"github.com/NotTesfamichael/tiru-emba/internal/filedrop"
 	"github.com/NotTesfamichael/tiru-emba/internal/network"
 	"github.com/NotTesfamichael/tiru-emba/internal/ui"
 )
@@ -56,7 +57,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "hint: another process may already be using UDP port %d\n", discovery.Port)
 		os.Exit(1)
 	}
-	msgServer, err := network.NewServer(*tcpPort)
+	// ~/Tiru_File is where accepted incoming file transfers land. Created up
+	// front so it's there before anyone ever sends a file, not just on first
+	// receipt; a failure here isn't fatal (chat still works), just a warning.
+	fileDir, err := filedrop.Dir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not create", filedrop.DirName, "directory:", err)
+		fmt.Fprintln(os.Stderr, "file transfers will fail to save until this is fixed")
+	}
+
+	msgServer, err := network.NewServer(*tcpPort, fileDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: could not start message server:", err)
 		fmt.Fprintf(os.Stderr, "hint: another process may already be using TCP port %d (try --port)\n", *tcpPort)
@@ -68,12 +78,14 @@ func main() {
 
 	peerC := make(chan discovery.PeerSeen, 32)
 	msgC := make(chan network.Received, 32)
+	fileOfferC := make(chan network.FileOffer, 8)
+	fileResultC := make(chan network.FileResult, 8)
 
 	go broadcaster.Run(ctx)
 	go listener.Run(ctx, selfID, peerC)
-	go msgServer.Run(ctx, msgC)
+	go msgServer.Run(ctx, msgC, fileOfferC, fileResultC)
 
-	model := ui.New(ctx, selfID, h, peerC, msgC)
+	model := ui.New(ctx, selfID, h, peerC, msgC, fileOfferC, fileResultC)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	final, err := p.Run()

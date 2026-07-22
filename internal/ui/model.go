@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
+	"github.com/NotTesfamichael/tiru-emba/internal/filedrop"
 	"github.com/NotTesfamichael/tiru-emba/internal/network"
 	"github.com/NotTesfamichael/tiru-emba/internal/notify"
 	"github.com/NotTesfamichael/tiru-emba/internal/peer"
@@ -36,6 +39,21 @@ type sendResultMsg struct {
 	err    error
 }
 
+// fileOfferMsg wraps an incoming network.FileOffer.
+type fileOfferMsg network.FileOffer
+
+// fileResultMsg wraps the eventual outcome of an accepted incoming transfer.
+type fileResultMsg network.FileResult
+
+// fileSendResultMsg reports the outcome of an async, in-flight SendFile.
+type fileSendResultMsg struct {
+	target   string
+	fileName string
+	accepted bool
+	reason   string
+	err      error
+}
+
 // pruneTickMsg fires periodically so the peer list drops teammates whose
 // heartbeat has gone stale (e.g. they closed the app or left the network).
 type pruneTickMsg time.Time
@@ -45,9 +63,16 @@ type Model struct {
 	selfID string
 	handle string
 
-	peers *peer.Registry
-	peerC <-chan discovery.PeerSeen
-	msgC  <-chan network.Received
+	peers   *peer.Registry
+	peerC   <-chan discovery.PeerSeen
+	msgC    <-chan network.Received
+	offerC  <-chan network.FileOffer
+	resultC <-chan network.FileResult
+
+	// fileOfferQueue holds pending incoming file-transfer requests; index 0
+	// is the one currently shown to the user, and while it's non-empty,
+	// normal input is suspended in favor of an accept/deny prompt.
+	fileOfferQueue []network.FileOffer
 
 	hist    *store.Store
 	history []store.Entry
@@ -65,7 +90,7 @@ type Model struct {
 	width, height int
 }
 
-func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen, msgC <-chan network.Received) Model {
+func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen, msgC <-chan network.Received, offerC <-chan network.FileOffer, resultC <-chan network.FileResult) Model {
 	ti := textinput.New()
 	ti.Placeholder = "@handle your message, or just type to broadcast..."
 	ti.Focus()
@@ -96,6 +121,8 @@ func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.Peer
 		peers:   peer.NewRegistry(),
 		peerC:   peerC,
 		msgC:    msgC,
+		offerC:  offerC,
+		resultC: resultC,
 		hist:    hist,
 		history: history,
 		input:   ti,
@@ -112,6 +139,8 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		waitForPeer(m.peerC),
 		waitForMessage(m.msgC),
+		waitForFileOffer(m.offerC),
+		waitForFileResult(m.resultC),
 		tea.Tick(pruneInterval, func(t time.Time) tea.Msg { return pruneTickMsg(t) }),
 		textinput.Blink,
 	)
@@ -151,6 +180,38 @@ func sendMessage(addr, from, target, body string) tea.Cmd {
 	}
 }
 
+// waitForFileOffer mirrors waitForPeer for incoming file-transfer requests.
+func waitForFileOffer(ch <-chan network.FileOffer) tea.Cmd {
+	return func() tea.Msg {
+		o, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return fileOfferMsg(o)
+	}
+}
+
+// waitForFileResult mirrors waitForPeer for the eventual outcome of an
+// accepted incoming transfer.
+func waitForFileResult(ch <-chan network.FileResult) tea.Cmd {
+	return func() tea.Msg {
+		r, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return fileResultMsg(r)
+	}
+}
+
+// sendFile offers path to whoever's listening at addr and blocks (in the
+// background, via network.SendFile) until they accept/deny or it times out.
+func sendFile(addr, from, target, path string) tea.Cmd {
+	return func() tea.Msg {
+		accepted, reason, err := network.SendFile(addr, from, path)
+		return fileSendResultMsg{target: target, fileName: filepath.Base(path), accepted: accepted, reason: reason, err: err}
+	}
+}
+
 // recordEntry appends e to the in-memory history and (best-effort) persists
 // it to disk. KindSystem entries are session-only and never written to disk
 // (see store.Store.Append).
@@ -171,6 +232,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if len(m.fileOfferQueue) > 0 {
+			return m.handleOfferKey(msg)
+		}
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			return m, tea.Quit
@@ -231,6 +295,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case fileOfferMsg:
+		m.fileOfferQueue = append(m.fileOfferQueue, network.FileOffer(msg))
+		return m, waitForFileOffer(m.offerC)
+
+	case fileResultMsg:
+		if msg.Err != nil {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("failed to receive %s from %s: %v", msg.FileName, msg.From, msg.Err)))
+		} else {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("received %s from %s -> saved to %s", msg.FileName, msg.From, msg.SavedPath)))
+			notify.Alert(fmt.Sprintf("File from %s", msg.From), fmt.Sprintf("%s saved to %s", msg.FileName, filedrop.DirName))
+		}
+		return m, waitForFileResult(m.resultC)
+
+	case fileSendResultMsg:
+		switch {
+		case msg.err != nil:
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("failed to send %s to %s: %v", msg.fileName, msg.target, msg.err)))
+		case !msg.accepted:
+			reason := msg.reason
+			if reason == "" {
+				reason = "declined"
+			}
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("%s did not accept %s: %s", msg.target, msg.fileName, reason)))
+		default:
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("%s delivered to %s", msg.fileName, msg.target)))
+		}
+		return m, nil
+
 	case pruneTickMsg:
 		m.peers.Prune(time.Time(msg), discovery.PeerTTL)
 		return m, tea.Tick(pruneInterval, func(t time.Time) tea.Msg { return pruneTickMsg(t) })
@@ -267,7 +359,10 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 // sendDirect parses leading "@handle" tokens (however many appear before the
 // first non-@ word) as the recipient list, and delivers the remaining text
 // to each of them independently -- one history entry per recipient, so
-// filtering/coloring stays a clean one-entry-one-peer relationship.
+// filtering/coloring stays a clean one-entry-one-peer relationship. If the
+// remaining text is actually a path to an existing file (dragging a file
+// onto most terminals inserts its absolute path as text), it's offered as a
+// file transfer instead of sent as a chat message.
 func (m Model) sendDirect(text string) (tea.Model, tea.Cmd) {
 	fields := strings.Fields(text)
 	i := 0
@@ -277,6 +372,10 @@ func (m Model) sendDirect(text string) (tea.Model, tea.Cmd) {
 		i++
 	}
 	body := strings.Join(fields[i:], " ")
+
+	if path, ok := filePathIn(body); ok {
+		return m.sendFileToTargets(targets, path)
+	}
 
 	var cmds []tea.Cmd
 	for _, target := range targets {
@@ -295,6 +394,75 @@ func (m Model) sendDirect(text string) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, sendMessage(addr, m.handle, info.Handle, body))
 	}
 	return m, tea.Batch(cmds...)
+}
+
+// sendFileToTargets offers the file at path to every target handle.
+func (m Model) sendFileToTargets(targets []string, path string) (tea.Model, tea.Cmd) {
+	info, err := os.Stat(path)
+	if err != nil {
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("can't read file %s: %v", path, err)))
+		return m, nil
+	}
+	if info.Size() > network.MaxFileSize {
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf(
+			"%s (%s) exceeds the %s limit", filepath.Base(path), network.HumanSize(info.Size()), network.HumanSize(network.MaxFileSize))))
+		return m, nil
+	}
+
+	var cmds []tea.Cmd
+	for _, target := range targets {
+		peerInfo, ok := m.peers.Lookup(target)
+		if !ok {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("no such peer online: %s", target)))
+			continue
+		}
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf(
+			"offering %s (%s) to %s, waiting for them to accept...", filepath.Base(path), network.HumanSize(info.Size()), peerInfo.Handle)))
+		addr := fmt.Sprintf("%s:%d", peerInfo.Addr, peerInfo.TCPPort)
+		cmds = append(cmds, sendFile(addr, m.handle, peerInfo.Handle, path))
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// filePathIn recognizes a message body that's actually a dropped file path.
+// Dragging a file onto most terminals inserts its absolute path as literal
+// text (some wrap it in matching quotes if the path contains spaces).
+func filePathIn(body string) (string, bool) {
+	body = strings.TrimSpace(body)
+	if len(body) >= 2 {
+		if (body[0] == '\'' && body[len(body)-1] == '\'') || (body[0] == '"' && body[len(body)-1] == '"') {
+			body = body[1 : len(body)-1]
+		}
+	}
+	if body == "" {
+		return "", false
+	}
+	info, err := os.Stat(body)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	return body, true
+}
+
+// handleOfferKey is the modal key handler while a file-transfer prompt is
+// showing: every other key is ignored until the user explicitly decides, to
+// avoid an accidental accept/deny.
+func (m Model) handleOfferKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "ctrl+c" {
+		return m, tea.Quit
+	}
+	offer := m.fileOfferQueue[0]
+	switch strings.ToLower(msg.String()) {
+	case "y", "enter":
+		offer.Respond(true)
+		m.fileOfferQueue = m.fileOfferQueue[1:]
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("accepted %s from %s -- receiving...", offer.FileName, offer.From)))
+	case "n", "esc":
+		offer.Respond(false)
+		m.fileOfferQueue = m.fileOfferQueue[1:]
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("declined %s from %s", offer.FileName, offer.From)))
+	}
+	return m, nil
 }
 
 // handleCommand implements the small slash-command set: /filter @handle
@@ -400,12 +568,23 @@ func (m Model) View() string {
 	input := inputStyle.Width(m.width - 4).Render(m.input.View())
 
 	sections := []string{title, body}
-	if suggestions := m.renderSuggestions(); suggestions != "" {
+	if offer := m.renderFileOfferPrompt(); offer != "" {
+		sections = append(sections, offer)
+	} else if suggestions := m.renderSuggestions(); suggestions != "" {
 		sections = append(sections, suggestions)
 	}
 	sections = append(sections, input)
 
 	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, sections...))
+}
+
+func (m Model) renderFileOfferPrompt() string {
+	if len(m.fileOfferQueue) == 0 {
+		return ""
+	}
+	o := m.fileOfferQueue[0]
+	text := fmt.Sprintf("%s wants to send %s (%s) -- accept? [y]es  [n]o", o.From, o.FileName, network.HumanSize(o.FileSize))
+	return lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render(text)
 }
 
 func (m Model) renderSuggestions() string {

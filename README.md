@@ -77,6 +77,24 @@ message` — it's delivered straight to that peer over TCP (`--port`, default
   losing Wi-Fi or closing the app doesn't lose your conversation. Join/leave
   notices and errors are session-only and aren't saved.
 
+### File transfer
+
+Drag a file onto the terminal window (most terminal emulators insert the
+absolute path as text) after typing the recipient, or just type the path
+yourself — `@kal /Users/you/Downloads/photo.png` — and press Enter. This
+sends an *offer*, not the file itself:
+
+1. `@kal` sees `<you> wants to send photo.png (2.3 MB) — accept? [y]es [n]o`
+   and must explicitly respond — nothing transfers without that.
+2. Only on accept does the file actually stream over TCP.
+3. Accepted files are saved into `~/Tiru_File` (created automatically on
+   first run for every install — not something you need to set up), with
+   `(1)`, `(2)`, ... appended if a same-named file is already there.
+
+Safety limits: transfers are capped at 200MB, and an incoming filename is
+always reduced to just its base name before being saved — a peer can't make
+your client write outside `~/Tiru_File` no matter what path it claims.
+
 ## Troubleshooting: "Online (0)", teammates not showing up
 
 Discovery uses UDP multicast, with UDP broadcast as a fallback (some

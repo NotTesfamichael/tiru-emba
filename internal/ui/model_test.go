@@ -2,6 +2,9 @@ package ui
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
@@ -15,7 +18,9 @@ func newTestModel(t *testing.T) Model {
 	t.Setenv("HOME", t.TempDir()) // sandbox history persistence away from the real user's home
 	peerC := make(chan discovery.PeerSeen)
 	msgC := make(chan network.Received)
-	return New(context.Background(), "self-id", "@me", peerC, msgC)
+	offerC := make(chan network.FileOffer)
+	resultC := make(chan network.FileResult)
+	return New(context.Background(), "self-id", "@me", peerC, msgC, offerC, resultC)
 }
 
 func TestSendDirectMultiTarget(t *testing.T) {
@@ -101,6 +106,55 @@ func TestColorForHandleDeterministicAndCaseInsensitive(t *testing.T) {
 	}
 	if colorForHandle("@kal") != colorForHandle("@kal") {
 		t.Error("colorForHandle should be deterministic across calls")
+	}
+}
+
+func TestFilePathInDetectsExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photo.png")
+	if err := os.WriteFile(path, []byte("fake image bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, ok := filePathIn(path); !ok || got != path {
+		t.Errorf("filePathIn(%q) = (%q, %v), want (%q, true)", path, got, ok, path)
+	}
+	if got, ok := filePathIn("'" + path + "'"); !ok || got != path {
+		t.Errorf("quoted filePathIn(%q) = (%q, %v), want (%q, true)", path, got, ok, path)
+	}
+	if _, ok := filePathIn("just a normal message"); ok {
+		t.Error("filePathIn should not match ordinary chat text")
+	}
+	if _, ok := filePathIn(dir); ok {
+		t.Error("filePathIn should not match a directory")
+	}
+}
+
+func TestSendDirectDetectsDroppedFile(t *testing.T) {
+	m := newTestModel(t)
+	m.peers.Upsert(peer.Info{ID: "1", Handle: "@kal", Addr: "127.0.0.1", TCPPort: 1})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(path, []byte("contents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m.input.SetValue("@kal " + path)
+	newModel, cmd := m.submitInput()
+	m = newModel.(Model)
+	if cmd == nil {
+		t.Fatal("expected a non-nil cmd for the file offer")
+	}
+
+	found := false
+	for _, e := range m.history {
+		if e.Kind == store.KindSystem && strings.Contains(e.Body, "offering") && strings.Contains(e.Body, "note.txt") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an 'offering note.txt' system note, history=%+v", m.history)
 	}
 }
 
