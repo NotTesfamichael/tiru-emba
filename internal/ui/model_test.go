@@ -130,6 +130,29 @@ func TestFilePathInDetectsExistingFile(t *testing.T) {
 	}
 }
 
+// Ghostty (and other terminals) backslash-escape spaces/specials in a
+// dropped file's path instead of quoting the whole thing -- this is the bug
+// report that came in after v0.4.0 shipped: a real file with a space in its
+// name never got recognized because the literal string (with the backslash)
+// doesn't exist on disk.
+func TestFilePathInHandlesShellEscapedSpaces(t *testing.T) {
+	dir := t.TempDir()
+	name := "2026-07-22 12.33.58.jpg"
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("fake image bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	escaped := filepath.Join(dir, `2026-07-22\ 12.33.58.jpg`)
+	got, ok := filePathIn(escaped)
+	if !ok {
+		t.Fatalf("filePathIn(%q) = not found, want the unescaped path recognized", escaped)
+	}
+	if got != path {
+		t.Errorf("filePathIn(%q) = %q, want %q", escaped, got, path)
+	}
+}
+
 func TestSendDirectDetectsDroppedFile(t *testing.T) {
 	m := newTestModel(t)
 	m.peers.Upsert(peer.Info{ID: "1", Handle: "@kal", Addr: "127.0.0.1", TCPPort: 1})

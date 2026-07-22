@@ -425,13 +425,18 @@ func (m Model) sendFileToTargets(targets []string, path string) (tea.Model, tea.
 }
 
 // filePathIn recognizes a message body that's actually a dropped file path.
-// Dragging a file onto most terminals inserts its absolute path as literal
-// text (some wrap it in matching quotes if the path contains spaces).
+// Dragging a file onto a terminal inserts its absolute path as literal text,
+// and terminals disagree on how they escape spaces/special characters in
+// that path: some wrap the whole thing in matching quotes, others (e.g.
+// Ghostty) backslash-escape each special character shell-style instead, so
+// "My Photo.png" arrives as `My\ Photo.png`. Both are handled here.
 func filePathIn(body string) (string, bool) {
 	body = strings.TrimSpace(body)
 	if len(body) >= 2 {
 		if (body[0] == '\'' && body[len(body)-1] == '\'') || (body[0] == '"' && body[len(body)-1] == '"') {
 			body = body[1 : len(body)-1]
+		} else {
+			body = unescapeShellPath(body)
 		}
 	}
 	if body == "" {
@@ -442,6 +447,23 @@ func filePathIn(body string) (string, bool) {
 		return "", false
 	}
 	return body, true
+}
+
+// unescapeShellPath undoes shell-style backslash escaping: a backslash
+// followed by any character is replaced with just that character.
+func unescapeShellPath(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // handleOfferKey is the modal key handler while a file-transfer prompt is
