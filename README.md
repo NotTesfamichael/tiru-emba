@@ -56,6 +56,27 @@ go build .
 tiru-emba --handle=@alex
 ```
 
+## Troubleshooting: "Online (0)", teammates not showing up
+
+Discovery uses UDP multicast, with UDP broadcast as a fallback (some
+consumer/mesh Wi-Fi routers relay one more reliably than the other between
+wireless clients). If you still see nobody:
+
+- **macOS Application Firewall**: it can silently drop incoming discovery
+  traffic to `tiru-emba` without ever showing the "allow incoming
+  connections?" prompt, especially since every release is a freshly-built,
+  differently ad-hoc-signed binary the firewall doesn't recognize yet. Check
+  System Settings → Network → Firewall, and either turn it off to confirm
+  that's the cause, or explicitly allow `tiru-emba`.
+- **macOS Local Network permission**: System Settings → Privacy & Security →
+  Local Network — this is granted per *terminal app* (Terminal, iTerm2,
+  Ghostty, ...), not per CLI tool, so check whichever terminal you're running
+  `tiru-emba` from.
+- **Client/AP isolation**: some routers (especially mesh systems and guest
+  networks) block device-to-device traffic entirely, multicast/broadcast
+  included. If teammates can't even `ping` each other's IP, this is a router
+  setting, not something the app can work around.
+
 ## Publishing / one-time setup
 
 Releases are built by [GoReleaser](https://goreleaser.com) via

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/ipv4"
@@ -83,6 +84,56 @@ func candidateInterfaces() []net.Interface {
 	return out
 }
 
+// subnetBroadcastAddr computes the directed broadcast address for ifi's IPv4
+// subnet (e.g. 192.168.0.100/24 -> 192.168.0.255). Returns nil if ifi has no
+// usable IPv4 address.
+func subnetBroadcastAddr(ifi net.Interface) net.IP {
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return nil
+	}
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipNet.IP.To4()
+		if ip4 == nil || len(ipNet.Mask) != net.IPv4len {
+			continue
+		}
+		bcast := make(net.IP, net.IPv4len)
+		for i := range ip4 {
+			bcast[i] = ip4[i] | ^ipNet.Mask[i]
+		}
+		return bcast
+	}
+	return nil
+}
+
+// enableBroadcast sets SO_BROADCAST on pc's underlying socket, required
+// before sending to any broadcast address (both a subnet-directed broadcast
+// like 192.168.0.255 and the global 255.255.255.255 are rejected by the OS
+// otherwise).
+func enableBroadcast(pc net.PacketConn) error {
+	sc, ok := pc.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	})
+	if !ok {
+		return fmt.Errorf("discovery: connection has no raw syscall access")
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var sockErr error
+	if err := raw.Control(func(fd uintptr) {
+		sockErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1)
+	}); err != nil {
+		return err
+	}
+	return sockErr
+}
+
 // Broadcaster periodically announces a Heartbeat on the multicast group.
 // NewBroadcaster does the socket setup synchronously so a bind failure is
 // reported before the caller does anything else (e.g. hands off to a TUI
@@ -106,6 +157,12 @@ func NewBroadcaster(hb Heartbeat) (*Broadcaster, error) {
 		return nil, fmt.Errorf("discovery: marshal heartbeat: %w", err)
 	}
 
+	// Best-effort: some consumer/mesh Wi-Fi routers relay true IP multicast
+	// between wireless clients unreliably (or not at all) even though
+	// broadcast works fine, so broadcast is sent as a fallback alongside
+	// multicast. If this fails, multicast-only still proceeds.
+	_ = enableBroadcast(conn)
+
 	return &Broadcaster{conn: conn, pconn: ipv4.NewPacketConn(conn), payload: payload}, nil
 }
 
@@ -117,7 +174,14 @@ func (b *Broadcaster) Run(ctx context.Context) error {
 			ifi := ifi
 			_ = b.pconn.SetMulticastInterface(&ifi)
 			_, _ = b.pconn.WriteTo(b.payload, nil, groupAddr())
+
+			if bcast := subnetBroadcastAddr(ifi); bcast != nil {
+				_, _ = b.pconn.WriteTo(b.payload, nil, &net.UDPAddr{IP: bcast, Port: Port})
+			}
 		}
+		// Global broadcast too, in case a subnet-directed address couldn't be
+		// computed for some interface (e.g. no addr, or point-to-point).
+		_, _ = b.pconn.WriteTo(b.payload, nil, &net.UDPAddr{IP: net.IPv4bcast, Port: Port})
 	}
 
 	ticker := time.NewTicker(HeartbeatInterval)
