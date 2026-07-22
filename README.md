@@ -56,10 +56,26 @@ go build .
 tiru-emba --handle=@alex
 ```
 
-Teammates on the same Wi-Fi network show up automatically in the sidebar.
-Send a direct message with `@handle your message` — it's delivered straight
-to that peer over TCP (`--port`, default `7777`, is what your own client
-listens on for incoming messages).
+Teammates on the same Wi-Fi network show up automatically in the sidebar,
+each assigned a stable color derived from their handle (same person, same
+color, for everyone, every session). Send a direct message with `@handle your
+message` — it's delivered straight to that peer over TCP (`--port`, default
+`7777`, is what your own client listens on for incoming messages).
+
+- **Multiple recipients**: list several handles before the message body —
+  `@kal @sam are we still on for 3pm` sends that text to both.
+- **Autocomplete**: start typing `@` and matching online handles appear above
+  the input; `Tab` accepts the highlighted one, `↑`/`↓` cycle through matches.
+- **Notifications**: an incoming message triggers a desktop notification with
+  sound. Best-effort — a machine with no notification daemon (e.g. a headless
+  SSH session) just skips it silently rather than failing.
+- **Filter by conversation**: `/filter @kal` hides everything except your
+  conversation with `@kal` (which also means "only that color"); `/clear`
+  shows everything again.
+- **Persistent history**: every direct message (sent and received) is saved
+  to `~/.tiru-emba/history/<handle>.jsonl` and reloaded on the next launch —
+  losing Wi-Fi or closing the app doesn't lose your conversation. Join/leave
+  notices and errors are session-only and aren't saved.
 
 ## Troubleshooting: "Online (0)", teammates not showing up
 

@@ -76,7 +76,11 @@ func main() {
 	model := ui.New(ctx, selfID, h, peerC, msgC)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
-	if _, err := p.Run(); err != nil {
+	final, err := p.Run()
+	if m, ok := final.(ui.Model); ok {
+		m.Close()
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "error running program:", err)
 		os.Exit(1)
 	}

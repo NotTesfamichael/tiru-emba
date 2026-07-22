@@ -1,0 +1,124 @@
+package ui
+
+import (
+	"context"
+	"testing"
+
+	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
+	"github.com/NotTesfamichael/tiru-emba/internal/network"
+	"github.com/NotTesfamichael/tiru-emba/internal/peer"
+	"github.com/NotTesfamichael/tiru-emba/internal/store"
+)
+
+func newTestModel(t *testing.T) Model {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir()) // sandbox history persistence away from the real user's home
+	peerC := make(chan discovery.PeerSeen)
+	msgC := make(chan network.Received)
+	return New(context.Background(), "self-id", "@me", peerC, msgC)
+}
+
+func TestSendDirectMultiTarget(t *testing.T) {
+	m := newTestModel(t)
+	m.peers.Upsert(peer.Info{ID: "1", Handle: "@kal", Addr: "127.0.0.1", TCPPort: 1})
+	m.peers.Upsert(peer.Info{ID: "2", Handle: "@sam", Addr: "127.0.0.1", TCPPort: 2})
+
+	m.input.SetValue("@kal @sam hello there")
+	newModel, cmd := m.submitInput()
+	m = newModel.(Model)
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil batch cmd for two live sends")
+	}
+
+	var sentTo []string
+	var bodies []string
+	for _, e := range m.history {
+		if e.Kind == store.KindDirectSent {
+			sentTo = append(sentTo, e.Peer)
+			bodies = append(bodies, e.Body)
+		}
+	}
+	if len(sentTo) != 2 || sentTo[0] != "@kal" || sentTo[1] != "@sam" {
+		t.Errorf("sentTo = %v, want [@kal @sam]", sentTo)
+	}
+	for _, b := range bodies {
+		if b != "hello there" {
+			t.Errorf("body = %q, want %q", b, "hello there")
+		}
+	}
+}
+
+func TestSendDirectUnknownPeer(t *testing.T) {
+	m := newTestModel(t)
+	m.input.SetValue("@ghost hi")
+	newModel, _ := m.submitInput()
+	m = newModel.(Model)
+
+	found := false
+	for _, e := range m.history {
+		if e.Kind == store.KindSystem && e.Body == "no such peer online: @ghost" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a 'no such peer online' system note")
+	}
+}
+
+func TestFilterCommand(t *testing.T) {
+	m := newTestModel(t)
+	m.peers.Upsert(peer.Info{ID: "1", Handle: "@kal", Addr: "127.0.0.1", TCPPort: 1})
+
+	m.input.SetValue("/filter @kal")
+	newModel, _ := m.submitInput()
+	m = newModel.(Model)
+	if m.filterPeer != "kal" {
+		t.Errorf("filterPeer = %q, want %q", m.filterPeer, "kal")
+	}
+
+	m.input.SetValue("/clear")
+	newModel, _ = m.submitInput()
+	m = newModel.(Model)
+	if m.filterPeer != "" {
+		t.Errorf("filterPeer = %q, want empty after /clear", m.filterPeer)
+	}
+}
+
+func TestFilterUnknownPeerLeavesFilterUnchanged(t *testing.T) {
+	m := newTestModel(t)
+	m.input.SetValue("/filter @ghost")
+	newModel, _ := m.submitInput()
+	m = newModel.(Model)
+	if m.filterPeer != "" {
+		t.Errorf("filterPeer = %q, want empty (unknown peer should not set a filter)", m.filterPeer)
+	}
+}
+
+func TestColorForHandleDeterministicAndCaseInsensitive(t *testing.T) {
+	if colorForHandle("@kal") != colorForHandle("@KAL") {
+		t.Error("colorForHandle should be case-insensitive")
+	}
+	if colorForHandle("@kal") != colorForHandle("@kal") {
+		t.Error("colorForHandle should be deterministic across calls")
+	}
+}
+
+func TestUpdateSuggestionsPrefixMatch(t *testing.T) {
+	m := newTestModel(t)
+	m.peers.Upsert(peer.Info{ID: "1", Handle: "@kal", Addr: "127.0.0.1", TCPPort: 1})
+	m.peers.Upsert(peer.Info{ID: "2", Handle: "@karim", Addr: "127.0.0.1", TCPPort: 2})
+	m.peers.Upsert(peer.Info{ID: "3", Handle: "@sam", Addr: "127.0.0.1", TCPPort: 3})
+
+	m.input.SetValue("@ka")
+	m.updateSuggestions()
+	if len(m.suggestions) != 2 {
+		t.Fatalf("suggestions = %v, want 2 matches for @ka", m.suggestions)
+	}
+
+	m.input.SetValue("@ka ")
+	m.updateSuggestions()
+	if len(m.suggestions) != 0 {
+		t.Error("expected no suggestions once a trailing space closes the handle token")
+	}
+}
