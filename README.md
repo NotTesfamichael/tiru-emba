@@ -56,6 +56,11 @@ go build .
 tiru-emba --handle=@alex
 ```
 
+Teammates on the same Wi-Fi network show up automatically in the sidebar.
+Send a direct message with `@handle your message` — it's delivered straight
+to that peer over TCP (`--port`, default `7777`, is what your own client
+listens on for incoming messages).
+
 ## Troubleshooting: "Online (0)", teammates not showing up
 
 Discovery uses UDP multicast, with UDP broadcast as a fallback (some

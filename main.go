@@ -1,6 +1,6 @@
-// Command tiru-emba is a zero-configuration, LAN-only terminal chat client.
-// Phase 1: peer discovery over UDP multicast + the Bubble Tea shell.
-// Phase 2 (not yet implemented): direct TCP messaging between peers.
+// Command tiru-emba is a zero-configuration, LAN-only terminal chat client:
+// peer discovery over UDP multicast/broadcast, direct messaging over TCP,
+// and a Bubble Tea shell tying them together.
 package main
 
 import (
@@ -15,12 +15,13 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
+	"github.com/NotTesfamichael/tiru-emba/internal/network"
 	"github.com/NotTesfamichael/tiru-emba/internal/ui"
 )
 
 func main() {
 	handle := flag.String("handle", "", `your display handle, e.g. "@alex" (required)`)
-	tcpPort := flag.Int("port", 7777, "TCP port reserved for direct messaging (Phase 2)")
+	tcpPort := flag.Int("port", 7777, "TCP port to listen on for direct messages")
 	flag.Parse()
 
 	h := strings.TrimSpace(*handle)
@@ -55,16 +56,24 @@ func main() {
 		fmt.Fprintf(os.Stderr, "hint: another process may already be using UDP port %d\n", discovery.Port)
 		os.Exit(1)
 	}
+	msgServer, err := network.NewServer(*tcpPort)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: could not start message server:", err)
+		fmt.Fprintf(os.Stderr, "hint: another process may already be using TCP port %d (try --port)\n", *tcpPort)
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	peerC := make(chan discovery.PeerSeen, 32)
+	msgC := make(chan network.Received, 32)
 
 	go broadcaster.Run(ctx)
 	go listener.Run(ctx, selfID, peerC)
+	go msgServer.Run(ctx, msgC)
 
-	model := ui.New(ctx, selfID, h, peerC)
+	model := ui.New(ctx, selfID, h, peerC, msgC)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {

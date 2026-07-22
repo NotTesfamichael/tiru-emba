@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
+	"github.com/NotTesfamichael/tiru-emba/internal/network"
 	"github.com/NotTesfamichael/tiru-emba/internal/peer"
 )
 
@@ -19,6 +20,15 @@ const pruneInterval = 1 * time.Second
 // peerSeenMsg wraps a discovery.PeerSeen so it can travel through Bubble
 // Tea's Msg pipeline.
 type peerSeenMsg discovery.PeerSeen
+
+// incomingMsgMsg wraps a network.Received direct message.
+type incomingMsgMsg network.Received
+
+// sendResultMsg reports the outcome of an async, in-flight Send.
+type sendResultMsg struct {
+	target string
+	err    error
+}
 
 // pruneTickMsg fires periodically so the peer list drops teammates whose
 // heartbeat has gone stale (e.g. they closed the app or left the network).
@@ -31,6 +41,7 @@ type Model struct {
 
 	peers *peer.Registry
 	peerC <-chan discovery.PeerSeen
+	msgC  <-chan network.Received
 
 	history []string
 	input   textinput.Model
@@ -38,7 +49,7 @@ type Model struct {
 	width, height int
 }
 
-func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen) Model {
+func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen, msgC <-chan network.Received) Model {
 	ti := textinput.New()
 	ti.Placeholder = "@handle your message, or just type to broadcast..."
 	ti.Focus()
@@ -51,6 +62,7 @@ func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.Peer
 		handle:  handle,
 		peers:   peer.NewRegistry(),
 		peerC:   peerC,
+		msgC:    msgC,
 		history: []string{fmt.Sprintf("welcome, %s. discovering teammates on the LAN...", handle)},
 		input:   ti,
 	}
@@ -59,6 +71,7 @@ func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.Peer
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		waitForPeer(m.peerC),
+		waitForMessage(m.msgC),
 		tea.Tick(pruneInterval, func(t time.Time) tea.Msg { return pruneTickMsg(t) }),
 		textinput.Blink,
 	)
@@ -74,6 +87,27 @@ func waitForPeer(ch <-chan discovery.PeerSeen) tea.Cmd {
 			return nil
 		}
 		return peerSeenMsg(p)
+	}
+}
+
+// waitForMessage mirrors waitForPeer for incoming direct messages.
+func waitForMessage(ch <-chan network.Received) tea.Cmd {
+	return func() tea.Msg {
+		r, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return incomingMsgMsg(r)
+	}
+}
+
+// sendMessage delivers a direct message in the background (network.Send
+// blocks on a TCP dial+write) so Update never stalls the UI on a slow or
+// unreachable peer.
+func sendMessage(addr, from, target, body string) tea.Cmd {
+	return func() tea.Msg {
+		err := network.Send(addr, network.Message{From: from, Body: body})
+		return sendResultMsg{target: target, err: err}
 	}
 }
 
@@ -115,6 +149,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, waitForPeer(m.peerC)
 
+	case incomingMsgMsg:
+		m.history = append(m.history, fmt.Sprintf("%s: %s", peerStyle.Render(msg.From), msg.Body))
+		return m, waitForMessage(m.msgC)
+
+	case sendResultMsg:
+		if msg.err != nil {
+			m.history = append(m.history, statusStyle.Render(fmt.Sprintf("failed to deliver to %s: %v", msg.target, msg.err)))
+		}
+		return m, nil
+
 	case pruneTickMsg:
 		m.peers.Prune(time.Time(msg), discovery.PeerTTL)
 		return m, tea.Tick(pruneInterval, func(t time.Time) tea.Msg { return pruneTickMsg(t) })
@@ -125,9 +169,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// submitInput handles the Enter key. Phase 1 has no TCP layer yet, so
-// messages are only echoed locally -- Phase 2 will route "@handle ..." to
-// the resolved peer's TCP address via peer.Registry.Lookup.
+// submitInput handles the Enter key: "@handle body" resolves the handle
+// against the peer registry and delivers body over TCP; anything else is
+// just a local note (there's no group broadcast channel, only direct
+// messages).
 func (m Model) submitInput() (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.input.Value())
 	if text == "" {
@@ -138,13 +183,18 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 	if strings.HasPrefix(text, "@") {
 		fields := strings.SplitN(text, " ", 2)
 		target := fields[0]
-		if _, ok := m.peers.Lookup(target); !ok {
+		info, ok := m.peers.Lookup(target)
+		if !ok {
 			m.history = append(m.history, statusStyle.Render(fmt.Sprintf("no such peer online: %s", target)))
 			return m, nil
 		}
+		body := ""
+		if len(fields) > 1 {
+			body = fields[1]
+		}
 		m.history = append(m.history, fmt.Sprintf("%s %s", selfStyle.Render(m.handle+" ->"), text))
-		// TODO(Phase 2): dial peer's TCPPort and send the message body.
-		return m, nil
+		addr := fmt.Sprintf("%s:%d", info.Addr, info.TCPPort)
+		return m, sendMessage(addr, m.handle, target, body)
 	}
 
 	m.history = append(m.history, fmt.Sprintf("%s: %s", selfStyle.Render(m.handle), text))
