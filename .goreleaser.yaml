@@ -1,0 +1,120 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: tiru-emba
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: tiru-emba
+    main: .
+    binary: tiru-emba
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .Commit }}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+# Homebrew tap: pushes a cask to github.com/NotTesfamichael/homebrew-tiru-emba
+# on every release ("brews"/Formula is deprecated upstream in favor of Casks).
+# That tap repo must exist (even empty) before this runs, and
+# HOMEBREW_TAP_GITHUB_TOKEN needs a PAT with repo access to it (the default
+# GITHUB_TOKEN can't write to a different repo).
+homebrew_casks:
+  - name: tiru-emba
+    binaries:
+      - tiru-emba
+    repository:
+      owner: NotTesfamichael
+      name: homebrew-tiru-emba
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/NotTesfamichael/tiru-emba"
+    description: "Zero-config LAN terminal chat over Wi-Fi, from the terminal."
+    # The binary isn't notarized (no Apple Developer ID), so macOS Gatekeeper
+    # would quarantine it on first run. This strips that quarantine flag on
+    # install, same trick most unsigned-binary casks use.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/tiru-emba"]
+          end
+
+# .deb / .rpm / .apk artifacts, attached to the GitHub release. Installable
+# immediately via `dpkg -i` / `rpm -i` / `apk add --allow-untrusted`; getting a
+# real `apt install tiru-emba` needs these hosted in an apt repo (see README).
+nfpms:
+  - id: packages
+    package_name: tiru-emba
+    file_name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    vendor: NotTesfamichael
+    homepage: "https://github.com/NotTesfamichael/tiru-emba"
+    maintainer: "NotTesfamichael <tesfa722@gmail.com>"
+    description: "Zero-config LAN terminal chat over Wi-Fi, from the terminal."
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+
+# Snap Store publishing. Requires a one-time `snapcraft export-login` to
+# populate the SNAPCRAFT_STORE_CREDENTIALS secret, and the "tiru-emba" name
+# registered in the store first (see README). Until that's done, drop
+# `publish: true` and this still builds a local .snap artifact.
+snapcrafts:
+  - name: tiru-emba
+    summary: Zero-config LAN terminal chat over Wi-Fi
+    description: |
+      tiru-emba discovers teammates on the same Wi-Fi network via UDP
+      multicast and lets you message them directly by handle, all from
+      a Bubble Tea terminal UI.
+    grade: stable
+    confinement: strict
+    publish: true
+    channel_templates:
+      - edge
+
+release:
+  github:
+    owner: NotTesfamichael
+    name: tiru-emba
+  footer: >-
+
+    ---
+
+    Install instructions: https://github.com/NotTesfamichael/tiru-emba#installation
