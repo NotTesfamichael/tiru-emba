@@ -9,6 +9,7 @@ package peer
 
 import (
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -48,9 +49,11 @@ func (r *Registry) Prune(now time.Time, ttl time.Duration) bool {
 }
 
 // Lookup resolves a handle (e.g. "@alex") to its current known address.
+// Matching is case-insensitive since there's no registration step to
+// enforce a canonical case -- "@Alex" and "@alex" are the same person.
 func (r *Registry) Lookup(handle string) (Info, bool) {
 	for _, info := range r.byID {
-		if info.Handle == handle {
+		if strings.EqualFold(info.Handle, handle) {
 			return info, true
 		}
 	}
