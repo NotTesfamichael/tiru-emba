@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -30,9 +32,9 @@ const (
 
 // Heartbeat is the wire format broadcast (multicast) by every running client.
 type Heartbeat struct {
-	ID      string `json:"id"`      // random per-process instance ID, used to ignore our own packets
-	Handle  string `json:"handle"`  // e.g. "@alex"
-	TCPPort int     `json:"tcp_port"` // port this peer listens on for direct messages (Phase 2)
+	ID      string `json:"id"`       // random per-process instance ID, used to ignore our own packets
+	Handle  string `json:"handle"`   // e.g. "@alex"
+	TCPPort int    `json:"tcp_port"` // port this peer listens on for direct messages (Phase 2)
 }
 
 // PeerSeen is emitted on the output channel every time a heartbeat from
@@ -45,91 +47,141 @@ type PeerSeen struct {
 	SeenAt  time.Time
 }
 
-func groupUDPAddr() *net.UDPAddr {
+func groupAddr() *net.UDPAddr {
 	return &net.UDPAddr{IP: net.ParseIP(GroupAddr), Port: Port}
 }
 
-// multicastInterface picks the first "real" up, multicast-capable, non-loopback
-// interface (typically the Wi-Fi adapter). Falling back to nil lets the OS
-// choose, which works but is less predictable on multi-homed machines.
-func multicastInterface() *net.Interface {
+// candidateInterfaces returns every up, multicast-capable, non-loopback
+// interface that has an IPv4 address. A machine on a real network commonly
+// has a dozen+ interfaces beyond the Wi-Fi adapter (VPN tunnels, Docker
+// bridges, Apple's awdl/llw/anpi interfaces, ...), any of which can satisfy a
+// naive "pick the first plausible one" check. Rather than guess which one is
+// "the" LAN adapter, every candidate is joined/sent on -- the real one just
+// needs to be somewhere in the set.
+func candidateInterfaces() []net.Interface {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
+	var out []net.Interface
 	for _, ifi := range ifaces {
-		if ifi.Flags&net.FlagUp == 0 {
-			continue
-		}
-		if ifi.Flags&net.FlagMulticast == 0 {
-			continue
-		}
-		if ifi.Flags&net.FlagLoopback != 0 {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagMulticast == 0 || ifi.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 		addrs, err := ifi.Addrs()
-		if err != nil || len(addrs) == 0 {
+		if err != nil {
 			continue
 		}
-		return &ifi
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if ok && ipNet.IP.To4() != nil {
+				out = append(out, ifi)
+				break
+			}
+		}
 	}
-	return nil
+	return out
 }
 
-// Broadcast periodically announces hb on the multicast group until ctx is
-// canceled. It's meant to be run in its own goroutine.
-func Broadcast(ctx context.Context, hb Heartbeat) error {
-	conn, err := net.DialUDP("udp4", nil, groupUDPAddr())
+// Broadcaster periodically announces a Heartbeat on the multicast group.
+// NewBroadcaster does the socket setup synchronously so a bind failure is
+// reported before the caller does anything else (e.g. hands off to a TUI
+// that would otherwise swallow it); Run does the actual periodic sending and
+// blocks until ctx is canceled, so it's meant to be called in a goroutine.
+type Broadcaster struct {
+	conn    net.PacketConn
+	pconn   *ipv4.PacketConn
+	payload []byte
+}
+
+func NewBroadcaster(hb Heartbeat) (*Broadcaster, error) {
+	conn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
-		return fmt.Errorf("discovery: dial multicast group: %w", err)
+		return nil, fmt.Errorf("discovery: open send socket: %w", err)
 	}
-	defer conn.Close()
 
 	payload, err := json.Marshal(hb)
 	if err != nil {
-		return fmt.Errorf("discovery: marshal heartbeat: %w", err)
+		conn.Close()
+		return nil, fmt.Errorf("discovery: marshal heartbeat: %w", err)
+	}
+
+	return &Broadcaster{conn: conn, pconn: ipv4.NewPacketConn(conn), payload: payload}, nil
+}
+
+func (b *Broadcaster) Run(ctx context.Context) error {
+	defer b.conn.Close()
+
+	send := func() {
+		for _, ifi := range candidateInterfaces() {
+			ifi := ifi
+			_ = b.pconn.SetMulticastInterface(&ifi)
+			_, _ = b.pconn.WriteTo(b.payload, nil, groupAddr())
+		}
 	}
 
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
 
-	// Send one immediately so peers don't wait a full interval to see us.
-	if _, err := conn.Write(payload); err != nil {
-		return fmt.Errorf("discovery: send heartbeat: %w", err)
-	}
+	send() // announce immediately so peers don't wait a full interval to see us
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if _, err := conn.Write(payload); err != nil {
-				return fmt.Errorf("discovery: send heartbeat: %w", err)
-			}
+			send()
 		}
 	}
 }
 
-// Listen joins the multicast group and emits a PeerSeen on out for every
-// heartbeat received from a different instance (selfID is used to filter out
-// our own announcements). It's meant to be run in its own goroutine and
-// blocks until ctx is canceled.
-func Listen(ctx context.Context, selfID string, out chan<- PeerSeen) error {
-	conn, err := net.ListenMulticastUDP("udp4", multicastInterface(), groupUDPAddr())
-	if err != nil {
-		return fmt.Errorf("discovery: listen multicast group: %w", err)
-	}
-	defer conn.Close()
+// Listener joins the multicast group (on every candidate interface) and
+// reports PeerSeen sightings. Mirrors Broadcaster's split: NewListener binds
+// and joins synchronously so a conflict (e.g. another process already on
+// Port) fails loudly right away, and Run does the actual blocking receive
+// loop, meant to be called in a goroutine.
+type Listener struct {
+	conn  net.PacketConn
+	pconn *ipv4.PacketConn
+}
 
-	// Unblock ReadFromUDP when ctx is canceled.
+func NewListener() (*Listener, error) {
+	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", Port))
+	if err != nil {
+		return nil, fmt.Errorf("discovery: listen udp :%d: %w", Port, err)
+	}
+	pconn := ipv4.NewPacketConn(conn)
+
+	joined := 0
+	for _, ifi := range candidateInterfaces() {
+		ifi := ifi
+		if err := pconn.JoinGroup(&ifi, groupAddr()); err == nil {
+			joined++
+		}
+	}
+	if joined == 0 {
+		conn.Close()
+		return nil, fmt.Errorf("discovery: failed to join multicast group %s on any interface", GroupAddr)
+	}
+
+	return &Listener{conn: conn, pconn: pconn}, nil
+}
+
+// Run emits a PeerSeen on out for every heartbeat received from a different
+// instance (selfID filters out our own announcements). Blocks until ctx is
+// canceled.
+func (l *Listener) Run(ctx context.Context, selfID string, out chan<- PeerSeen) error {
+	defer l.conn.Close()
+
+	// Unblock ReadFrom when ctx is canceled.
 	go func() {
 		<-ctx.Done()
-		conn.Close()
+		l.conn.Close()
 	}()
 
 	buf := make([]byte, maxDatagramSize)
 	for {
-		n, src, err := conn.ReadFromUDP(buf)
+		n, _, src, err := l.pconn.ReadFrom(buf)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -137,6 +189,11 @@ func Listen(ctx context.Context, selfID string, out chan<- PeerSeen) error {
 			default:
 				continue
 			}
+		}
+
+		udpSrc, ok := src.(*net.UDPAddr)
+		if !ok {
+			continue
 		}
 
 		var hb Heartbeat
@@ -150,7 +207,7 @@ func Listen(ctx context.Context, selfID string, out chan<- PeerSeen) error {
 		peer := PeerSeen{
 			ID:      hb.ID,
 			Handle:  hb.Handle,
-			Addr:    src.IP,
+			Addr:    udpSrc.IP,
 			TCPPort: hb.TCPPort,
 			SeenAt:  time.Now(),
 		}
