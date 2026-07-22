@@ -80,17 +80,19 @@ func main() {
 	msgC := make(chan network.Received, 32)
 	fileOfferC := make(chan network.FileOffer, 8)
 	fileResultC := make(chan network.FileResult, 8)
+	gameInviteC := make(chan network.GameInvite, 8)
 
 	go broadcaster.Run(ctx)
 	go listener.Run(ctx, selfID, peerC)
-	go msgServer.Run(ctx, msgC, fileOfferC, fileResultC)
+	go msgServer.Run(ctx, msgC, fileOfferC, fileResultC, gameInviteC)
 
-	model := ui.New(ctx, selfID, h, peerC, msgC, fileOfferC, fileResultC)
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	chat := ui.New(ctx, selfID, h, peerC, msgC, fileOfferC, fileResultC, gameInviteC)
+	app := ui.NewApp(chat)
+	p := tea.NewProgram(app, tea.WithAltScreen())
 
 	final, err := p.Run()
-	if m, ok := final.(ui.Model); ok {
-		m.Close()
+	if a, ok := final.(ui.App); ok {
+		a.Close()
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error running program:", err)

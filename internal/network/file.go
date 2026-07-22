@@ -57,14 +57,7 @@ func (s *Server) handleFileOffer(ctx context.Context, conn net.Conn, reader *buf
 		if accept {
 			out.Type = typeFileAccept
 		}
-		b, err := json.Marshal(out)
-		if err != nil {
-			return err
-		}
-		b = append(b, '\n')
-		_ = conn.SetWriteDeadline(time.Now().Add(dialTimeout))
-		_, err = conn.Write(b)
-		return err
+		return writeEnvelope(conn, out)
 	}
 
 	if env.FileSize < 0 {
@@ -175,7 +168,7 @@ func SendFile(addr, from, path string) (accepted bool, reason string, err error)
 	}
 	defer conn.Close()
 
-	transferID, err := randomTransferID()
+	transferID, err := randomID()
 	if err != nil {
 		return false, "", fmt.Errorf("network: generate transfer id: %w", err)
 	}
@@ -187,14 +180,7 @@ func SendFile(addr, from, path string) (accepted bool, reason string, err error)
 		FileSize:   info.Size(),
 		TransferID: transferID,
 	}
-	b, err := json.Marshal(offer)
-	if err != nil {
-		return false, "", fmt.Errorf("network: marshal offer: %w", err)
-	}
-	b = append(b, '\n')
-
-	_ = conn.SetWriteDeadline(time.Now().Add(dialTimeout))
-	if _, err := conn.Write(b); err != nil {
+	if err := writeEnvelope(conn, offer); err != nil {
 		return false, "", fmt.Errorf("network: send offer: %w", err)
 	}
 
@@ -262,7 +248,7 @@ func HumanSize(n int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
 }
 
-func randomTransferID() (string, error) {
+func randomID() (string, error) {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		return "", err

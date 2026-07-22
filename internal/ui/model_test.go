@@ -20,7 +20,8 @@ func newTestModel(t *testing.T) Model {
 	msgC := make(chan network.Received)
 	offerC := make(chan network.FileOffer)
 	resultC := make(chan network.FileResult)
-	return New(context.Background(), "self-id", "@me", peerC, msgC, offerC, resultC)
+	inviteC := make(chan network.GameInvite)
+	return New(context.Background(), "self-id", "@me", peerC, msgC, offerC, resultC, inviteC)
 }
 
 func TestSendDirectMultiTarget(t *testing.T) {
@@ -87,6 +88,70 @@ func TestFilterCommand(t *testing.T) {
 	m = newModel.(Model)
 	if m.filterPeer != "" {
 		t.Errorf("filterPeer = %q, want empty after /clear", m.filterPeer)
+	}
+}
+
+func TestPlayCommandChallengesOnlinePeer(t *testing.T) {
+	m := newTestModel(t)
+	m.peers.Upsert(peer.Info{ID: "1", Handle: "@kal", Addr: "127.0.0.1", TCPPort: 7777})
+
+	m.input.SetValue("/play tictactoe @kal")
+	newModel, cmd := m.submitInput()
+	m = newModel.(Model)
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil cmd to issue the challenge")
+	}
+	found := false
+	for _, e := range m.history {
+		if e.Kind == store.KindSystem && strings.Contains(e.Body, "challenging @kal") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a 'challenging @kal' system note, history=%+v", m.history)
+	}
+}
+
+func TestPlayCommandUnknownGame(t *testing.T) {
+	m := newTestModel(t)
+	m.peers.Upsert(peer.Info{ID: "1", Handle: "@kal", Addr: "127.0.0.1", TCPPort: 7777})
+
+	m.input.SetValue("/play chess @kal")
+	newModel, cmd := m.submitInput()
+	m = newModel.(Model)
+
+	if cmd != nil {
+		t.Error("expected no challenge to be issued for an unsupported game")
+	}
+	found := false
+	for _, e := range m.history {
+		if e.Kind == store.KindSystem && strings.Contains(e.Body, "unknown game") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an 'unknown game' system note, history=%+v", m.history)
+	}
+}
+
+func TestPlayCommandUnknownPeer(t *testing.T) {
+	m := newTestModel(t)
+	m.input.SetValue("/play tictactoe @ghost")
+	newModel, cmd := m.submitInput()
+	m = newModel.(Model)
+
+	if cmd != nil {
+		t.Error("expected no challenge to be issued for an offline peer")
+	}
+	found := false
+	for _, e := range m.history {
+		if e.Kind == store.KindSystem && e.Body == "no such peer online: @ghost" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a 'no such peer online' system note, history=%+v", m.history)
 	}
 }
 

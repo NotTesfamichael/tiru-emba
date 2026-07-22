@@ -94,6 +94,20 @@ Safety limits: transfers are capped at 200MB, and an incoming filename is
 always reduced to just its base name before being saved — a peer can't make
 your client write outside `~/Downloads` no matter what path it claims.
 
+### Games
+
+`/play tictactoe @kal` challenges an online peer. Like a file offer, nothing
+starts until they respond to `<you> challenges you to tictactoe — accept?
+[y]es [n]o`. On accept, both clients switch to a full-screen Tic-Tac-Toe
+board — arrows or WASD to move the cursor, Enter to place your mark, Esc to
+resign. The connection used for the invite stays open for the whole game (it
+isn't a fire-and-forget message, unlike chat), so moves land on the
+opponent's board immediately. When the game ends (win, draw, or a
+resignation), both sides drop back into chat with a note about how it went.
+
+More games are meant to build on this same foundation later, hence the
+explicit `tictactoe` argument in the command rather than a bare `/play @kal`.
+
 ## Troubleshooting: "Online (0)", teammates not showing up
 
 Discovery uses UDP multicast, with UDP broadcast as a fallback (some

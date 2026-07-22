@@ -13,21 +13,28 @@ import (
 
 func startTestServer(t *testing.T, fileDir string) (addr string, offerC chan FileOffer, resultC chan FileResult) {
 	t.Helper()
+	addr, _, offerC, resultC, _ = startTestServerFull(t, fileDir)
+	return addr, offerC, resultC
+}
+
+func startTestServerFull(t *testing.T, fileDir string) (addr string, msgC chan Received, offerC chan FileOffer, resultC chan FileResult, inviteC chan GameInvite) {
+	t.Helper()
 	srv, err := NewServer(0, fileDir)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 	addr = srv.ln.Addr().String()
 
-	msgC := make(chan Received, 4)
+	msgC = make(chan Received, 4)
 	offerC = make(chan FileOffer, 4)
 	resultC = make(chan FileResult, 4)
+	inviteC = make(chan GameInvite, 4)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go srv.Run(ctx, msgC, offerC, resultC)
+	go srv.Run(ctx, msgC, offerC, resultC, inviteC)
 
-	return addr, offerC, resultC
+	return addr, msgC, offerC, resultC, inviteC
 }
 
 func TestSendFileAcceptedRoundTrip(t *testing.T) {

@@ -54,6 +54,31 @@ type fileSendResultMsg struct {
 	err      error
 }
 
+// gameInviteMsg wraps an incoming network.GameInvite.
+type gameInviteMsg network.GameInvite
+
+// gameInviteAcceptedMsg reports the outcome of accepting an incoming
+// invite. On success, the hosting router (App) intercepts this before it
+// ever reaches Model.Update, to switch to the game screen; Model only ever
+// sees the error case, to report it as a system note.
+type gameInviteAcceptedMsg struct {
+	invite  network.GameInvite
+	session *network.GameSession
+	err     error
+}
+
+// gameChallengeResultMsg reports the outcome of an outgoing /play challenge.
+// Same split as gameInviteAcceptedMsg: App handles the accepted case (screen
+// switch), Model handles everything else (denied, timed out, failed to
+// connect).
+type gameChallengeResultMsg struct {
+	opponent string
+	session  *network.GameSession
+	accepted bool
+	reason   string
+	err      error
+}
+
 // pruneTickMsg fires periodically so the peer list drops teammates whose
 // heartbeat has gone stale (e.g. they closed the app or left the network).
 type pruneTickMsg time.Time
@@ -68,11 +93,16 @@ type Model struct {
 	msgC    <-chan network.Received
 	offerC  <-chan network.FileOffer
 	resultC <-chan network.FileResult
+	inviteC <-chan network.GameInvite
 
 	// fileOfferQueue holds pending incoming file-transfer requests; index 0
 	// is the one currently shown to the user, and while it's non-empty,
 	// normal input is suspended in favor of an accept/deny prompt.
 	fileOfferQueue []network.FileOffer
+
+	// gameInviteQueue mirrors fileOfferQueue for incoming game challenges.
+	// Checked after fileOfferQueue so the two modal prompts never collide.
+	gameInviteQueue []network.GameInvite
 
 	hist    *store.Store
 	history []store.Entry
@@ -90,7 +120,7 @@ type Model struct {
 	width, height int
 }
 
-func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen, msgC <-chan network.Received, offerC <-chan network.FileOffer, resultC <-chan network.FileResult) Model {
+func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen, msgC <-chan network.Received, offerC <-chan network.FileOffer, resultC <-chan network.FileResult, inviteC <-chan network.GameInvite) Model {
 	ti := textinput.New()
 	ti.Placeholder = "@handle your message, or just type to broadcast..."
 	ti.Focus()
@@ -123,6 +153,7 @@ func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.Peer
 		msgC:    msgC,
 		offerC:  offerC,
 		resultC: resultC,
+		inviteC: inviteC,
 		hist:    hist,
 		history: history,
 		input:   ti,
@@ -135,12 +166,27 @@ func (m Model) Close() {
 	m.hist.Close()
 }
 
+// Handle returns this client's own handle, e.g. for a hosting router that
+// needs it to construct a game screen.
+func (m Model) Handle() string {
+	return m.handle
+}
+
+// WithSystemNote appends a session-only note to the chat log -- meant for a
+// hosting router to call when handing control back to Model, e.g. reporting
+// how a game just ended.
+func (m Model) WithSystemNote(text string) Model {
+	m.history = recordEntry(m.history, m.hist, systemNote(text))
+	return m
+}
+
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		waitForPeer(m.peerC),
 		waitForMessage(m.msgC),
 		waitForFileOffer(m.offerC),
 		waitForFileResult(m.resultC),
+		waitForGameInvite(m.inviteC),
 		tea.Tick(pruneInterval, func(t time.Time) tea.Msg { return pruneTickMsg(t) }),
 		textinput.Blink,
 	)
@@ -212,6 +258,36 @@ func sendFile(addr, from, target, path string) tea.Cmd {
 	}
 }
 
+// waitForGameInvite mirrors waitForPeer for incoming game challenges.
+func waitForGameInvite(ch <-chan network.GameInvite) tea.Cmd {
+	return func() tea.Msg {
+		i, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return gameInviteMsg(i)
+	}
+}
+
+// acceptGameInvite accepts invite in the background (the write itself is
+// quick, but it's kept off Update like every other network call here for
+// consistency and so a slow/dead peer can never stall the UI).
+func acceptGameInvite(invite network.GameInvite) tea.Cmd {
+	return func() tea.Msg {
+		session, err := invite.Accept()
+		return gameInviteAcceptedMsg{invite: invite, session: session, err: err}
+	}
+}
+
+// challengeToGame dials addr and issues a game challenge, blocking in the
+// background until the opponent accepts/denies or it times out.
+func challengeToGame(ctx context.Context, addr, from, opponent, gameType string) tea.Cmd {
+	return func() tea.Msg {
+		session, reason, err := network.SendGameInvite(ctx, addr, from, gameType)
+		return gameChallengeResultMsg{opponent: opponent, session: session, accepted: session != nil, reason: reason, err: err}
+	}
+}
+
 // recordEntry appends e to the in-memory history and (best-effort) persists
 // it to disk. KindSystem entries are session-only and never written to disk
 // (see store.Store.Append).
@@ -234,6 +310,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if len(m.fileOfferQueue) > 0 {
 			return m.handleOfferKey(msg)
+		}
+		if len(m.gameInviteQueue) > 0 {
+			return m.handleGameInviteKey(msg)
 		}
 		switch msg.String() {
 		case "ctrl+c", "esc":
@@ -320,6 +399,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("%s did not accept %s: %s", msg.target, msg.fileName, reason)))
 		default:
 			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("%s delivered to %s", msg.fileName, msg.target)))
+		}
+		return m, nil
+
+	case gameInviteMsg:
+		m.gameInviteQueue = append(m.gameInviteQueue, network.GameInvite(msg))
+		return m, waitForGameInvite(m.inviteC)
+
+	case gameInviteAcceptedMsg:
+		// The success path is handled by the hosting router (App) before
+		// this ever reaches here; only the failure path shows up.
+		if msg.err != nil {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("couldn't start the game with %s: %v", msg.invite.From, msg.err)))
+		}
+		return m, nil
+
+	case gameChallengeResultMsg:
+		// Same split as above: App handles accepted, Model handles the rest.
+		if msg.err != nil {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("failed to challenge %s: %v", msg.opponent, msg.err)))
+		} else if !msg.accepted {
+			reason := msg.reason
+			if reason == "" {
+				reason = "declined"
+			}
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("%s did not accept your tic-tac-toe challenge: %s", msg.opponent, reason)))
 		}
 		return m, nil
 
@@ -487,11 +591,34 @@ func (m Model) handleOfferKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleCommand implements the small slash-command set: /filter @handle
-// (hide everything except that conversation) and /clear (show everything).
+// handleGameInviteKey is the modal key handler while a game challenge
+// prompt is showing: every other key is ignored until the user explicitly
+// decides, same as handleOfferKey for file transfers.
+func (m Model) handleGameInviteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "ctrl+c" {
+		return m, tea.Quit
+	}
+	invite := m.gameInviteQueue[0]
+	switch strings.ToLower(msg.String()) {
+	case "y", "enter":
+		m.gameInviteQueue = m.gameInviteQueue[1:]
+		return m, acceptGameInvite(invite)
+	case "n", "esc":
+		invite.Deny()
+		m.gameInviteQueue = m.gameInviteQueue[1:]
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("declined %s's tic-tac-toe challenge", invite.From)))
+	}
+	return m, nil
+}
+
+// handleCommand implements the slash-command set: /filter @handle (hide
+// everything except that conversation), /clear (show everything), and
+// /play tictactoe @handle (challenge a peer to a game).
 func (m Model) handleCommand(text string) (tea.Model, tea.Cmd) {
 	fields := strings.Fields(text)
 	switch strings.ToLower(fields[0]) {
+	case "/play":
+		return m.handlePlayCommand(fields)
 	case "/filter":
 		if len(fields) < 2 {
 			m.history = recordEntry(m.history, m.hist, systemNote("usage: /filter @handle"))
@@ -511,6 +638,30 @@ func (m Model) handleCommand(text string) (tea.Model, tea.Cmd) {
 		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("unknown command: %s", fields[0])))
 	}
 	return m, nil
+}
+
+// handlePlayCommand parses "/play tictactoe @handle" and, if the target is
+// online, issues the challenge. tictactoe is the only game so far, but the
+// explicit game-name argument keeps the command's shape ready for more.
+func (m Model) handlePlayCommand(fields []string) (tea.Model, tea.Cmd) {
+	if len(fields) != 3 {
+		m.history = recordEntry(m.history, m.hist, systemNote("usage: /play tictactoe @handle"))
+		return m, nil
+	}
+	game := strings.ToLower(fields[1])
+	target := fields[2]
+	if game != "tictactoe" {
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("unknown game: %s (only tictactoe for now)", fields[1])))
+		return m, nil
+	}
+	info, ok := m.peers.Lookup(target)
+	if !ok {
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("no such peer online: %s", target)))
+		return m, nil
+	}
+	m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("challenging %s to tic-tac-toe, waiting for them to accept...", info.Handle)))
+	addr := fmt.Sprintf("%s:%d", info.Addr, info.TCPPort)
+	return m, challengeToGame(m.ctx, addr, m.handle, info.Handle, "tictactoe")
 }
 
 // updateSuggestions recomputes the @handle autocomplete list from the
@@ -590,10 +741,13 @@ func (m Model) View() string {
 	input := inputStyle.Width(m.width - 4).Render(m.input.View())
 
 	sections := []string{title, body}
-	if offer := m.renderFileOfferPrompt(); offer != "" {
-		sections = append(sections, offer)
-	} else if suggestions := m.renderSuggestions(); suggestions != "" {
-		sections = append(sections, suggestions)
+	switch {
+	case m.renderFileOfferPrompt() != "":
+		sections = append(sections, m.renderFileOfferPrompt())
+	case m.renderGameInvitePrompt() != "":
+		sections = append(sections, m.renderGameInvitePrompt())
+	case m.renderSuggestions() != "":
+		sections = append(sections, m.renderSuggestions())
 	}
 	sections = append(sections, input)
 
@@ -606,6 +760,15 @@ func (m Model) renderFileOfferPrompt() string {
 	}
 	o := m.fileOfferQueue[0]
 	text := fmt.Sprintf("%s wants to send %s (%s) -- accept? [y]es  [n]o", o.From, o.FileName, network.HumanSize(o.FileSize))
+	return lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render(text)
+}
+
+func (m Model) renderGameInvitePrompt() string {
+	if len(m.gameInviteQueue) == 0 {
+		return ""
+	}
+	i := m.gameInviteQueue[0]
+	text := fmt.Sprintf("%s challenges you to %s -- accept? [y]es  [n]o", i.From, i.GameType)
 	return lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render(text)
 }
 
