@@ -19,8 +19,24 @@ import (
 	"github.com/NotTesfamichael/tiru-emba/internal/network"
 	"github.com/NotTesfamichael/tiru-emba/internal/notify"
 	"github.com/NotTesfamichael/tiru-emba/internal/peer"
+	"github.com/NotTesfamichael/tiru-emba/internal/relay"
 	"github.com/NotTesfamichael/tiru-emba/internal/store"
 )
+
+// relayClient is what Model needs from a relay.Client -- narrowed to an
+// interface so it can be tested against a fake instead of a real
+// connection, the same pattern the game packages use for their own
+// Session interfaces. nil (the interface itself, not just what it wraps --
+// see New) when not connected to a relay server, i.e. LAN-only mode.
+type relayClient interface {
+	CreateOrg(name string) (relay.OrgSummary, error)
+	ListOrgs() ([]relay.OrgSummary, error)
+	InviteToOrg(orgID int64) (code string, expiresAt time.Time, err error)
+	JoinOrg(code string) (relay.OrgSummary, error)
+	SendRelay(to, body string) error
+	Events() <-chan relay.Envelope
+	Close() error
+}
 
 const (
 	pruneInterval  = 1 * time.Second
@@ -126,6 +142,32 @@ type startNetworkedLudoMsg struct {
 // heartbeat has gone stale (e.g. they closed the app or left the network).
 type pruneTickMsg time.Time
 
+// relayEventMsg wraps an asynchronous push from the relay server --
+// presence changes, or an incoming relayed message -- so it can travel
+// through Bubble Tea's Msg pipeline.
+type relayEventMsg relay.Envelope
+
+// relaySendResultMsg reports a LOCAL write failure from an async SendRelay
+// call. A successful send produces no message at all (fire-and-forget by
+// protocol design -- see relay.Client); application-level failures like
+// "not online" or "no shared org" arrive later as a relayEventMsg instead,
+// same as any other unsolicited push.
+type relaySendResultMsg struct {
+	target string
+	err    error
+}
+
+// orgActionResultMsg reports the outcome of an async /org request, tagged
+// by which one it was so Update can react appropriately.
+type orgActionResultMsg struct {
+	kind    string // "create", "list", "invite", "join"
+	org     relay.OrgSummary
+	orgs    []relay.OrgSummary
+	code    string
+	expires time.Time
+	err     error
+}
+
 type Model struct {
 	ctx    context.Context
 	selfID string
@@ -151,6 +193,12 @@ type Model struct {
 	// multi-invite round; nil whenever no such invite is in flight.
 	ludoLobby *ludoLobby
 
+	// relay is nil in LAN-only mode. orgMates mirrors relay presence
+	// pushes: the set of org-mates currently online (keyed by their exact
+	// handle as the server sent it), parallel to peers for LAN discovery.
+	relay    relayClient
+	orgMates map[string]bool
+
 	hist    *store.Store
 	history []store.Entry
 
@@ -173,7 +221,15 @@ type Model struct {
 	width, height int
 }
 
-func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen, msgC <-chan network.Received, offerC <-chan network.FileOffer, resultC <-chan network.FileResult, inviteC <-chan network.GameInvite) Model {
+// New constructs the chat model. relayC is nil for LAN-only mode; when
+// non-nil, the caller is expected to have already registered/logged in
+// with it (see main.go's connectToRelay) -- New just starts consuming its
+// Events. Accepting the concrete *relay.Client here (rather than the
+// relayClient interface directly) and nil-checking before storing it
+// avoids the classic Go "typed nil interface" trap: a nil *relay.Client
+// stored directly into an interface-typed field would make that field
+// compare != nil even though nothing is actually there.
+func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen, msgC <-chan network.Received, offerC <-chan network.FileOffer, resultC <-chan network.FileResult, inviteC <-chan network.GameInvite, relayC *relay.Client) Model {
 	ti := textinput.New()
 	ti.Placeholder = "@handle your message, or just type to broadcast..."
 	ti.Focus()
@@ -184,11 +240,11 @@ func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.Peer
 
 	history := make([]store.Entry, 0, len(saved)+2)
 	history = append(history, saved...)
-	history = append(history, store.Entry{
-		Kind: store.KindSystem,
-		Body: fmt.Sprintf("welcome, %s. discovering teammates on the LAN...", handle),
-		At:   time.Now(),
-	})
+	welcome := fmt.Sprintf("welcome, %s. discovering teammates on the LAN...", handle)
+	if relayC != nil {
+		welcome += " connected to the relay server."
+	}
+	history = append(history, store.Entry{Kind: store.KindSystem, Body: welcome, At: time.Now()})
 	if err != nil {
 		history = append(history, store.Entry{
 			Kind: store.KindSystem,
@@ -197,26 +253,34 @@ func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.Peer
 		})
 	}
 
-	return Model{
-		ctx:     ctx,
-		selfID:  selfID,
-		handle:  handle,
-		peers:   peer.NewRegistry(),
-		peerC:   peerC,
-		msgC:    msgC,
-		offerC:  offerC,
-		resultC: resultC,
-		inviteC: inviteC,
-		hist:    hist,
-		history: history,
-		input:   ti,
+	m := Model{
+		ctx:      ctx,
+		selfID:   selfID,
+		handle:   handle,
+		peers:    peer.NewRegistry(),
+		peerC:    peerC,
+		msgC:     msgC,
+		offerC:   offerC,
+		resultC:  resultC,
+		inviteC:  inviteC,
+		orgMates: make(map[string]bool),
+		hist:     hist,
+		history:  history,
+		input:    ti,
 	}
+	if relayC != nil {
+		m.relay = relayC
+	}
+	return m
 }
 
-// Close flushes/closes the history file. Call once after the Bubble Tea
-// program exits.
+// Close flushes/closes the history file and (in relay mode) the relay
+// connection. Call once after the Bubble Tea program exits.
 func (m Model) Close() {
 	m.hist.Close()
+	if m.relay != nil {
+		_ = m.relay.Close()
+	}
 }
 
 // Handle returns this client's own handle, e.g. for a hosting router that
@@ -234,7 +298,7 @@ func (m Model) WithSystemNote(text string) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		waitForPeer(m.peerC),
 		waitForMessage(m.msgC),
 		waitForFileOffer(m.offerC),
@@ -242,7 +306,11 @@ func (m Model) Init() tea.Cmd {
 		waitForGameInvite(m.inviteC),
 		tea.Tick(pruneInterval, func(t time.Time) tea.Msg { return pruneTickMsg(t) }),
 		textinput.Blink,
-	)
+	}
+	if m.relay != nil {
+		cmds = append(cmds, waitForRelayEvent(m.relay))
+	}
+	return tea.Batch(cmds...)
 }
 
 // waitForPeer blocks on the discovery channel and turns the next sighting
@@ -348,6 +416,58 @@ func challengeToLudoLobby(ctx context.Context, addr, from, opponent string, idx 
 	return func() tea.Msg {
 		session, reason, err := network.SendGameInvite(ctx, addr, from, "ludo")
 		return ludoChallengeResultMsg{idx: idx, opponent: opponent, session: session, accepted: session != nil, reason: reason, err: err}
+	}
+}
+
+// waitForRelayEvent blocks on the relay client's event channel and turns
+// the next push into a tea.Msg, mirroring waitForPeer for the LAN side.
+// Update() re-issues this Cmd after each message so the pump keeps running
+// for the lifetime of the connection.
+func waitForRelayEvent(c relayClient) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-c.Events()
+		if !ok {
+			return nil // connection closed; let the pump stop quietly
+		}
+		return relayEventMsg(ev)
+	}
+}
+
+// sendRelay delivers body to target over the relay in the background,
+// mirroring sendMessage for the LAN side. See relaySendResultMsg for why
+// only a local write failure surfaces from this Cmd.
+func sendRelay(c relayClient, target, body string) tea.Cmd {
+	return func() tea.Msg {
+		err := c.SendRelay(target, body)
+		return relaySendResultMsg{target: target, err: err}
+	}
+}
+
+func createOrgCmd(c relayClient, name string) tea.Cmd {
+	return func() tea.Msg {
+		org, err := c.CreateOrg(name)
+		return orgActionResultMsg{kind: "create", org: org, err: err}
+	}
+}
+
+func listOrgsCmd(c relayClient) tea.Cmd {
+	return func() tea.Msg {
+		orgs, err := c.ListOrgs()
+		return orgActionResultMsg{kind: "list", orgs: orgs, err: err}
+	}
+}
+
+func inviteOrgCmd(c relayClient, orgID int64) tea.Cmd {
+	return func() tea.Msg {
+		code, expiresAt, err := c.InviteToOrg(orgID)
+		return orgActionResultMsg{kind: "invite", code: code, expires: expiresAt, err: err}
+	}
+}
+
+func joinOrgCmd(c relayClient, code string) tea.Cmd {
+	return func() tea.Msg {
+		org, err := c.JoinOrg(code)
+		return orgActionResultMsg{kind: "join", org: org, err: err}
 	}
 }
 
@@ -507,6 +627,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ludoChallengeResultMsg:
 		return m.handleLudoChallengeResult(msg)
 
+	case relayEventMsg:
+		return m.handleRelayEvent(msg)
+
+	case relaySendResultMsg:
+		if msg.err != nil {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("failed to deliver to %s: %v", msg.target, msg.err)))
+		}
+		return m, nil
+
+	case orgActionResultMsg:
+		return m.handleOrgActionResult(msg)
+
 	case pruneTickMsg:
 		m.peers.Prune(time.Time(msg), discovery.PeerTTL)
 		return m, tea.Tick(pruneInterval, func(t time.Time) tea.Msg { return pruneTickMsg(t) })
@@ -540,22 +672,40 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 	}
 }
 
-// sendBroadcast delivers text to every currently online peer. There's no
-// shared broadcast channel on the wire -- this is really just the same
-// direct-message send fanned out to everyone the registry currently knows
-// about -- but from the user's side it reads as "just type to broadcast",
-// matching the input placeholder.
+// orgMateOnline case-insensitively matches target against currently-online
+// org-mates, mirroring peer.Registry.Lookup's case-insensitive handle
+// comparison (there's no registration step to enforce a canonical case on
+// either side).
+func (m Model) orgMateOnline(target string) (string, bool) {
+	for handle := range m.orgMates {
+		if strings.EqualFold(handle, target) {
+			return handle, true
+		}
+	}
+	return "", false
+}
+
+// sendBroadcast delivers text to every currently online peer -- both LAN
+// (direct TCP) and, in relay mode, every online org-mate. There's no
+// shared broadcast channel on either transport -- this is really just the
+// same direct-message send fanned out to everyone currently known about --
+// but from the user's side it reads as "just type to broadcast", matching
+// the input placeholder.
 func (m Model) sendBroadcast(text string) (tea.Model, tea.Cmd) {
 	m.history = recordEntry(m.history, m.hist, store.Entry{Kind: store.KindSelfNote, Body: text, At: time.Now()})
 
-	peers := m.peers.List()
-	if len(peers) == 0 {
-		return m, nil
-	}
-	cmds := make([]tea.Cmd, 0, len(peers))
-	for _, p := range peers {
+	var cmds []tea.Cmd
+	for _, p := range m.peers.List() {
 		addr := fmt.Sprintf("%s:%d", p.Addr, p.TCPPort)
 		cmds = append(cmds, sendMessage(addr, m.handle, p.Handle, text))
+	}
+	if m.relay != nil {
+		for handle := range m.orgMates {
+			cmds = append(cmds, sendRelay(m.relay, handle, text))
+		}
+	}
+	if len(cmds) == 0 {
+		return m, nil
 	}
 	return m, tea.Batch(cmds...)
 }
@@ -563,7 +713,9 @@ func (m Model) sendBroadcast(text string) (tea.Model, tea.Cmd) {
 // sendDirect parses leading "@handle" tokens (however many appear before the
 // first non-@ word) as the recipient list, and delivers the remaining text
 // to each of them independently -- one history entry per recipient, so
-// filtering/coloring stays a clean one-entry-one-peer relationship. If the
+// filtering/coloring stays a clean one-entry-one-peer relationship. Each
+// target resolves against LAN peers first, then online org-mates (relay
+// mode); file transfer (see filePathIn) is LAN-only for now. If the
 // remaining text is actually a path to an existing file (dragging a file
 // onto most terminals inserts its absolute path as text), it's offered as a
 // file transfer instead of sent as a chat message.
@@ -583,20 +735,30 @@ func (m Model) sendDirect(text string) (tea.Model, tea.Cmd) {
 
 	var cmds []tea.Cmd
 	for _, target := range targets {
-		info, ok := m.peers.Lookup(target)
-		if !ok {
-			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("no such peer online: %s", target)))
+		if info, ok := m.peers.Lookup(target); ok {
+			m.history = recordEntry(m.history, m.hist, store.Entry{
+				Kind: store.KindDirectSent,
+				Peer: info.Handle,
+				Body: body,
+				At:   time.Now(),
+			})
+			m.lastDMHandle = info.Handle
+			addr := fmt.Sprintf("%s:%d", info.Addr, info.TCPPort)
+			cmds = append(cmds, sendMessage(addr, m.handle, info.Handle, body))
 			continue
 		}
-		m.history = recordEntry(m.history, m.hist, store.Entry{
-			Kind: store.KindDirectSent,
-			Peer: info.Handle,
-			Body: body,
-			At:   time.Now(),
-		})
-		m.lastDMHandle = info.Handle
-		addr := fmt.Sprintf("%s:%d", info.Addr, info.TCPPort)
-		cmds = append(cmds, sendMessage(addr, m.handle, info.Handle, body))
+		if handle, ok := m.orgMateOnline(target); ok {
+			m.history = recordEntry(m.history, m.hist, store.Entry{
+				Kind: store.KindDirectSent,
+				Peer: handle,
+				Body: body,
+				At:   time.Now(),
+			})
+			m.lastDMHandle = handle
+			cmds = append(cmds, sendRelay(m.relay, handle, body))
+			continue
+		}
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("no such peer online: %s", target)))
 	}
 	return m, tea.Batch(cmds...)
 }
@@ -726,24 +888,33 @@ var commandSpecs = []commandSpec{
 	{"/play ludo @handle", "invite up to 3 peers to a networked Ludo match"},
 	{"/filter @handle", "show only your conversation with that peer"},
 	{"/clear", "clear the active filter"},
+	{"/org create <name>", "create an organization (you become its admin) -- requires --server"},
+	{"/org list", "list the organizations you belong to -- requires --server"},
+	{"/org invite <id>", "generate an invite code for an org you admin -- requires --server"},
+	{"/org join <code>", "redeem an invite code to join an org -- requires --server"},
 	{"/help", "list every slash command"},
 }
 
 // handleCommand implements the slash-command set: /filter @handle (hide
 // everything except that conversation), /clear (show everything), /play
-// (challenge a peer or start a local game), and /help (list all of these).
+// (challenge a peer or start a local game), /org (organization management,
+// relay mode only), and /help (list all of these).
 func (m Model) handleCommand(text string) (tea.Model, tea.Cmd) {
 	fields := strings.Fields(text)
 	switch strings.ToLower(fields[0]) {
 	case "/play":
 		return m.handlePlayCommand(fields)
+	case "/org":
+		return m.handleOrgCommand(fields)
 	case "/filter":
 		if len(fields) < 2 {
 			m.history = recordEntry(m.history, m.hist, systemNote("usage: /filter @handle"))
 			return m, nil
 		}
 		target := fields[1]
-		if _, ok := m.peers.Lookup(target); !ok {
+		_, lanOK := m.peers.Lookup(target)
+		_, orgOK := m.orgMateOnline(target)
+		if !lanOK && !orgOK {
 			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("no such peer online: %s", target)))
 			return m, nil
 		}
@@ -761,6 +932,57 @@ func (m Model) handleCommand(text string) (tea.Model, tea.Cmd) {
 		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("unknown command: %s (try /help)", fields[0])))
 	}
 	return m, nil
+}
+
+// handleOrgCommand implements "/org create|list|invite|join", all of which
+// require a relay connection (organizations don't exist in LAN-only mode).
+// Each subcommand dispatches an async Cmd; the result comes back later as
+// an orgActionResultMsg.
+func (m Model) handleOrgCommand(fields []string) (tea.Model, tea.Cmd) {
+	if m.relay == nil {
+		m.history = recordEntry(m.history, m.hist, systemNote("orgs require a relay server -- restart with --server=host:port"))
+		return m, nil
+	}
+	if len(fields) < 2 {
+		m.history = recordEntry(m.history, m.hist, systemNote("usage: /org create <name> | /org list | /org invite <id> | /org join <code>"))
+		return m, nil
+	}
+
+	switch strings.ToLower(fields[1]) {
+	case "create":
+		if len(fields) < 3 {
+			m.history = recordEntry(m.history, m.hist, systemNote("usage: /org create <name>"))
+			return m, nil
+		}
+		name := strings.Join(fields[2:], " ")
+		return m, createOrgCmd(m.relay, name)
+
+	case "list":
+		return m, listOrgsCmd(m.relay)
+
+	case "invite":
+		if len(fields) != 3 {
+			m.history = recordEntry(m.history, m.hist, systemNote("usage: /org invite <org-id> (see /org list for IDs)"))
+			return m, nil
+		}
+		orgID, err := strconv.ParseInt(fields[2], 10, 64)
+		if err != nil {
+			m.history = recordEntry(m.history, m.hist, systemNote("org id must be a number (see /org list)"))
+			return m, nil
+		}
+		return m, inviteOrgCmd(m.relay, orgID)
+
+	case "join":
+		if len(fields) != 3 {
+			m.history = recordEntry(m.history, m.hist, systemNote("usage: /org join <code>"))
+			return m, nil
+		}
+		return m, joinOrgCmd(m.relay, fields[2])
+
+	default:
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("unknown /org subcommand: %s (try create, list, invite, join)", fields[1])))
+		return m, nil
+	}
 }
 
 // handlePlayCommand implements "/play tictactoe @handle" (challenge a peer
@@ -901,6 +1123,73 @@ func (m Model) handleLudoChallengeResult(msg ludoChallengeResultMsg) (tea.Model,
 	}
 }
 
+// handleRelayEvent reacts to one asynchronous push from the relay server:
+// presence changes update orgMates the same way peerSeenMsg updates peers,
+// and an incoming relayed message is recorded exactly like a LAN
+// incomingMsgMsg -- from the chat log's point of view, a relay message and
+// a LAN message are indistinguishable once they've arrived.
+func (m Model) handleRelayEvent(msg relayEventMsg) (tea.Model, tea.Cmd) {
+	ev := relay.Envelope(msg)
+	switch ev.Type {
+	case relay.MsgPresenceJoined:
+		if !m.orgMates[ev.Handle] {
+			m.orgMates[ev.Handle] = true
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("%s %s joined (org)", avatarForHandle(ev.Handle), ev.Handle)))
+		}
+
+	case relay.MsgPresenceLeft:
+		delete(m.orgMates, ev.Handle)
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("%s left (org)", ev.Handle)))
+
+	case relay.MsgRelay:
+		m.history = recordEntry(m.history, m.hist, store.Entry{
+			Kind: store.KindDirectRecv,
+			Peer: ev.Handle,
+			Body: ev.Body,
+			At:   time.Now(),
+		})
+		m.lastDMHandle = ev.Handle
+		notify.Alert(fmt.Sprintf("Message from %s", ev.Handle), ev.Body)
+
+	case relay.MsgError:
+		// An unsolicited error, e.g. a fire-and-forget SendRelay that
+		// failed (see relaySendResultMsg's doc comment).
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("relay: %s", ev.Reason)))
+	}
+	return m, waitForRelayEvent(m.relay)
+}
+
+// handleOrgActionResult reports the outcome of an async /org request.
+func (m Model) handleOrgActionResult(msg orgActionResultMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("org %s failed: %v", msg.kind, msg.err)))
+		return m, nil
+	}
+
+	switch msg.kind {
+	case "create":
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("created org %q (id %d) -- you're its admin", msg.org.Name, msg.org.ID)))
+
+	case "list":
+		if len(msg.orgs) == 0 {
+			m.history = recordEntry(m.history, m.hist, systemNote("you don't belong to any orgs yet -- /org create <name> or /org join <code>"))
+			break
+		}
+		m.history = recordEntry(m.history, m.hist, systemNote("your orgs:"))
+		for _, o := range msg.orgs {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("  [%d] %s", o.ID, o.Name)))
+		}
+
+	case "invite":
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf(
+			"invite code: %s (expires %s) -- share it with whoever you're inviting", msg.code, msg.expires.Format(time.RFC1123))))
+
+	case "join":
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("joined org %q (id %d)", msg.org.Name, msg.org.ID)))
+	}
+	return m, nil
+}
+
 // updateSuggestions recomputes whichever autocomplete list applies to the
 // input's current contents: matching slash commands while a "/word" is
 // still being typed (no space yet), matching @handles while the last word
@@ -943,6 +1232,11 @@ func (m *Model) updateSuggestions() {
 	for _, p := range m.peers.List() {
 		if strings.HasPrefix(strings.ToLower(p.Handle), partial) {
 			matches = append(matches, p.Handle)
+		}
+	}
+	for h := range m.orgMates {
+		if strings.HasPrefix(strings.ToLower(h), partial) {
+			matches = append(matches, h)
 		}
 	}
 	sort.Strings(matches)
@@ -1080,22 +1374,47 @@ func (m Model) renderSuggestions() string {
 
 func (m Model) renderSidebar(width, height int) string {
 	var b strings.Builder
-	b.WriteString(sidebarHeaderStyle.Render(fmt.Sprintf("Online (%d)", m.peers.Len())))
+	b.WriteString(sidebarHeaderStyle.Render(fmt.Sprintf("LAN (%d)", m.peers.Len())))
 	b.WriteString("\n\n")
 	for _, p := range m.peers.List() {
-		style := lipgloss.NewStyle().Foreground(colorForHandle(p.Handle))
-		line := avatarForHandle(p.Handle) + " " + p.Handle
-		if strings.EqualFold(strings.TrimPrefix(p.Handle, "@"), m.filterPeer) {
-			line += " [filter]"
-			style = style.Bold(true)
-		}
-		b.WriteString(style.Render(line))
+		b.WriteString(m.renderSidebarLine(p.Handle))
 		b.WriteString("\n")
 	}
 	if m.peers.Len() == 0 {
 		b.WriteString(statusStyle.Render("searching..."))
 	}
+
+	if m.relay != nil {
+		b.WriteString("\n")
+		b.WriteString(sidebarHeaderStyle.Render(fmt.Sprintf("Org (%d)", len(m.orgMates))))
+		b.WriteString("\n\n")
+		mates := make([]string, 0, len(m.orgMates))
+		for h := range m.orgMates {
+			mates = append(mates, h)
+		}
+		sort.Strings(mates)
+		for _, h := range mates {
+			b.WriteString(m.renderSidebarLine(h))
+			b.WriteString("\n")
+		}
+		if len(m.orgMates) == 0 {
+			b.WriteString(statusStyle.Render("none online"))
+		}
+	}
+
 	return sidebarStyle.Width(width).Height(height).Render(b.String())
+}
+
+// renderSidebarLine renders one handle for either the LAN or Org section --
+// same avatar/color/filter-highlight treatment regardless of which.
+func (m Model) renderSidebarLine(handle string) string {
+	style := lipgloss.NewStyle().Foreground(colorForHandle(handle))
+	line := avatarForHandle(handle) + " " + handle
+	if strings.EqualFold(strings.TrimPrefix(handle, "@"), m.filterPeer) {
+		line += " [filter]"
+		style = style.Bold(true)
+	}
+	return style.Render(line)
 }
 
 func (m Model) renderChat(width, height int) string {

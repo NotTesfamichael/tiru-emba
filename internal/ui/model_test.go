@@ -21,7 +21,7 @@ func newTestModel(t *testing.T) Model {
 	offerC := make(chan network.FileOffer)
 	resultC := make(chan network.FileResult)
 	inviteC := make(chan network.GameInvite)
-	return New(context.Background(), "self-id", "@me", peerC, msgC, offerC, resultC, inviteC)
+	return New(context.Background(), "self-id", "@me", peerC, msgC, offerC, resultC, inviteC, nil)
 }
 
 func TestSendDirectMultiTarget(t *testing.T) {
