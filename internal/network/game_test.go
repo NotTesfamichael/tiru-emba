@@ -77,6 +77,47 @@ func TestGameInviteAcceptedThenMovesExchangeBothWays(t *testing.T) {
 	}
 }
 
+func TestSendDataRoundTrip(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr, _, _, _, inviteC := startTestServerFull(t, t.TempDir())
+
+	var challengerSession *GameSession
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		session, _, err := SendGameInvite(ctx, addr, "@host", "ludo")
+		if err != nil {
+			t.Errorf("SendGameInvite: %v", err)
+			return
+		}
+		challengerSession = session
+	}()
+
+	invite := <-inviteC
+	inviteeSession, err := invite.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer inviteeSession.Close()
+	<-sendDone
+	defer challengerSession.Close()
+
+	payload := `{"kind":"roll"}`
+	if err := challengerSession.SendData(payload); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
+	select {
+	case ev := <-inviteeSession.Events():
+		if ev.Kind != GameEventMove || ev.Data != payload {
+			t.Errorf("got %+v, want a move event with Data=%q", ev, payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the data payload")
+	}
+}
+
 func TestGameInviteDenied(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

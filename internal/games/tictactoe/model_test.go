@@ -272,6 +272,31 @@ func TestMoveSentErrorEndsGame(t *testing.T) {
 	}
 }
 
+func TestHandleEventIgnoredOnceGameIsDone(t *testing.T) {
+	sess := newFakeSession()
+	m := New(sess, X, "@me", "@kal")
+	m.board[0], m.board[1] = X, X
+	m.turn = X
+	m.cursor = 2
+
+	m, _ = m.handleKey(key("enter")) // wins the game, closes the session
+	if !m.done || m.resultText != "you win!" {
+		t.Fatalf("setup: expected the win to already be recorded, got done=%v resultText=%q", m.done, m.resultText)
+	}
+
+	// A waitForGameEvent armed before the win can still deliver one more
+	// event -- e.g. the disconnect our own opponent's socket sees once our
+	// Close() runs. That must not overwrite the win with a second,
+	// contradictory GameOverMsg.
+	m, cmd := m.handleEvent(network.GameEvent{Kind: network.GameEventDisconnected})
+	if cmd != nil {
+		t.Errorf("expected no cmd once the game is already done, got %v", cmd())
+	}
+	if m.resultText != "you win!" {
+		t.Errorf("resultText = %q, want the original %q to survive a stray post-game event", m.resultText, "you win!")
+	}
+}
+
 // findGameOverMsg executes cmd (and, if it's a batch, its sub-commands)
 // looking for a GameOverMsg, failing the test if none is found.
 func findGameOverMsg(t *testing.T, cmd tea.Cmd) GameOverMsg {

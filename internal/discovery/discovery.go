@@ -185,7 +185,7 @@ type Listener struct {
 }
 
 func NewListener() (*Listener, error) {
-	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", Port))
+	conn, err := listenPacketReusable(context.Background(), "udp4", fmt.Sprintf(":%d", Port))
 	if err != nil {
 		return nil, fmt.Errorf("discovery: listen udp :%d: %w", Port, err)
 	}

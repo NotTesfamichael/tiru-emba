@@ -21,7 +21,8 @@ const (
 // GameEvent is one thing that happened on the other end of a GameSession.
 type GameEvent struct {
 	Kind     GameEventKind
-	Position int // meaningful only for GameEventMove
+	Position int    // meaningful only for GameEventMove; tictactoe's board index
+	Data     string // meaningful only for GameEventMove; an arbitrary JSON payload for games richer than a single int (e.g. Ludo's host-broadcast state / guest actions)
 }
 
 // GameInvite is surfaced to the UI for an incoming game challenge. Exactly
@@ -103,7 +104,7 @@ func (s *GameSession) readLoop(ctx context.Context, reader *bufio.Reader) {
 		var ev GameEvent
 		switch env.Type {
 		case typeGameMove:
-			ev = GameEvent{Kind: GameEventMove, Position: env.Position}
+			ev = GameEvent{Kind: GameEventMove, Position: env.Position, Data: env.Data}
 		case typeGameResign:
 			ev = GameEvent{Kind: GameEventResign}
 		default:
@@ -127,6 +128,14 @@ func (s *GameSession) Events() <-chan GameEvent {
 // SendMove tells the opponent a mark was placed at pos (0-8).
 func (s *GameSession) SendMove(pos int) error {
 	return writeEnvelope(s.conn, envelope{Type: typeGameMove, Position: pos})
+}
+
+// SendData sends an arbitrary payload to the other end of the session, for
+// games whose moves don't fit a single int -- e.g. a host broadcasting a
+// full serialized board state, or a guest sending back a structured action.
+// Arrives on the other end as GameEvent{Kind: GameEventMove, Data: data}.
+func (s *GameSession) SendData(data string) error {
+	return writeEnvelope(s.conn, envelope{Type: typeGameMove, Data: data})
 }
 
 // Resign tells the opponent you're quitting the game early.

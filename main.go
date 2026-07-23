@@ -14,6 +14,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/NotTesfamichael/tiru-emba/internal/config"
 	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
 	"github.com/NotTesfamichael/tiru-emba/internal/filedrop"
 	"github.com/NotTesfamichael/tiru-emba/internal/network"
@@ -21,17 +22,14 @@ import (
 )
 
 func main() {
-	handle := flag.String("handle", "", `your display handle, e.g. "@alex" (required)`)
+	handle := flag.String("handle", "", `your display handle, e.g. "@alex" (registers it for next time; omit to reuse a saved handle, or run anonymously if none is saved)`)
 	tcpPort := flag.Int("port", 7777, "TCP port to listen on for direct messages")
 	flag.Parse()
 
-	h := strings.TrimSpace(*handle)
-	if h == "" {
-		fmt.Fprintln(os.Stderr, `error: --handle is required, e.g. --handle=@alex`)
+	h, err := resolveHandle(*handle)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
-	}
-	if !strings.HasPrefix(h, "@") {
-		h = "@" + h
 	}
 
 	selfID, err := randomID()
@@ -98,6 +96,40 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error running program:", err)
 		os.Exit(1)
 	}
+}
+
+// resolveHandle implements a lightweight "registration" flow: an explicit
+// --handle registers itself for next time (saved to config), no flag reuses
+// a previously-registered handle silently, and with neither, a random
+// anonymous handle is generated -- and deliberately not persisted, so every
+// anonymous run gets a fresh one rather than "registering" anonymity.
+func resolveHandle(flagValue string) (string, error) {
+	h := strings.TrimSpace(flagValue)
+	if h != "" {
+		if !strings.HasPrefix(h, "@") {
+			h = "@" + h
+		}
+		if err := config.Save(config.Config{Handle: h}); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not save handle for next time:", err)
+		}
+		return h, nil
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not read saved handle:", err)
+	} else if cfg.Handle != "" {
+		return cfg.Handle, nil
+	}
+
+	suffix, err := randomID()
+	if err != nil {
+		return "", fmt.Errorf("no handle registered and could not generate an anonymous one: %w", err)
+	}
+	anon := "@anon-" + suffix[:6]
+	fmt.Fprintf(os.Stderr, "no handle registered -- joining anonymously as %s\n", anon)
+	fmt.Fprintln(os.Stderr, "hint: pass --handle=@you once to register a permanent handle for next time")
+	return anon, nil
 }
 
 func randomID() (string, error) {

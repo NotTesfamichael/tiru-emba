@@ -3,6 +3,7 @@ package ui
 import (
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/NotTesfamichael/tiru-emba/internal/games/ludo"
 	"github.com/NotTesfamichael/tiru-emba/internal/games/tictactoe"
 )
 
@@ -12,6 +13,7 @@ type screen int
 const (
 	screenChat screen = iota
 	screenGame
+	screenLudo
 )
 
 // App is the top-level Bubble Tea model. It owns which screen is active and
@@ -24,6 +26,7 @@ type App struct {
 	screen screen
 	chat   Model
 	game   tictactoe.Model
+	ludo   ludo.Model
 }
 
 // NewApp constructs the router, starting on the chat screen.
@@ -38,14 +41,19 @@ func (a App) Init() tea.Cmd {
 func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// Keep the chat screen's dimensions fresh even while the game screen
+		// Keep the chat screen's dimensions fresh even while another screen
 		// is active, so returning to chat after a mid-game resize doesn't
 		// render with stale width/height.
 		newChat, _ := a.chat.Update(msg)
 		a.chat = newChat.(Model)
-		if a.screen == screenGame {
+		switch a.screen {
+		case screenGame:
 			game, cmd := a.game.Update(msg)
 			a.game = game
+			return a, cmd
+		case screenLudo:
+			lg, cmd := a.ludo.Update(msg)
+			a.ludo = lg
 			return a, cmd
 		}
 		return a, nil
@@ -62,9 +70,16 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case gameInviteAcceptedMsg:
 		if msg.err == nil {
-			a.screen = screenGame
-			a.game = tictactoe.New(msg.session, tictactoe.O, a.chat.Handle(), msg.invite.From)
-			return a, a.game.Init()
+			switch msg.invite.GameType {
+			case "ludo":
+				a.screen = screenLudo
+				a.ludo = ludo.NewGuest(a.chat.Handle(), msg.session)
+				return a, a.ludo.Init()
+			default: // "tictactoe"
+				a.screen = screenGame
+				a.game = tictactoe.New(msg.session, tictactoe.O, a.chat.Handle(), msg.invite.From)
+				return a, a.game.Init()
+			}
 		}
 		newChat, cmd := a.chat.Update(msg)
 		a.chat = newChat.(Model)
@@ -75,11 +90,36 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.chat = a.chat.WithSystemNote(msg.ResultText)
 		a.game = tictactoe.Model{}
 		return a, nil
+
+	case startLudoMsg:
+		a.screen = screenLudo
+		a.ludo = ludo.New(a.chat.Handle(), msg.numAI)
+		return a, a.ludo.Init()
+
+	case startNetworkedLudoMsg:
+		a.screen = screenLudo
+		sessions := make([]ludo.Session, len(msg.sessions))
+		for i, s := range msg.sessions {
+			sessions[i] = s
+		}
+		a.ludo = ludo.NewHost(a.chat.Handle(), msg.guestHandles, sessions)
+		return a, a.ludo.Init()
+
+	case ludo.GameOverMsg:
+		a.screen = screenChat
+		a.chat = a.chat.WithSystemNote(msg.ResultText)
+		a.ludo = ludo.Model{}
+		return a, nil
 	}
 
-	if a.screen == screenGame {
+	switch a.screen {
+	case screenGame:
 		game, cmd := a.game.Update(msg)
 		a.game = game
+		return a, cmd
+	case screenLudo:
+		lg, cmd := a.ludo.Update(msg)
+		a.ludo = lg
 		return a, cmd
 	}
 
@@ -89,8 +129,11 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (a App) View() string {
-	if a.screen == screenGame {
+	switch a.screen {
+	case screenGame:
 		return a.game.View()
+	case screenLudo:
+		return a.ludo.View()
 	}
 	return a.chat.View()
 }

@@ -145,26 +145,43 @@ func (m Model) attemptMove(pos int) (Model, tea.Cmd) {
 	}
 
 	m.board[pos] = m.mySymbol
-	moveCmd := sendMove(m.session, pos)
 
 	if winner := m.board.winner(); winner != Empty {
 		m.done = true
 		m.resultText = "you win!"
+		// Sent synchronously and before Close: sendMove's tea.Cmd form only
+		// runs *after* this function returns, so if Close ran first (as it
+		// used to), the opponent's connection would drop before the
+		// winning move ever reached them -- they'd see "connection lost"
+		// instead of the actual result.
+		_ = m.session.SendMove(pos)
 		_ = m.session.Close()
-		return m, tea.Batch(moveCmd, func() tea.Msg { return GameOverMsg{ResultText: m.resultText} })
+		return m, func() tea.Msg { return GameOverMsg{ResultText: m.resultText} }
 	}
 	if m.board.full() {
 		m.done = true
 		m.resultText = "draw"
+		_ = m.session.SendMove(pos)
 		_ = m.session.Close()
-		return m, tea.Batch(moveCmd, func() tea.Msg { return GameOverMsg{ResultText: m.resultText} })
+		return m, func() tea.Msg { return GameOverMsg{ResultText: m.resultText} }
 	}
 
 	m.turn = m.turn.Other()
-	return m, moveCmd
+	return m, sendMove(m.session, pos)
 }
 
 func (m Model) handleEvent(ev network.GameEvent) (Model, tea.Cmd) {
+	if m.done {
+		// The game already concluded (we won/drew/resigned and closed our
+		// end of the session ourselves): a stray waitForGameEvent from
+		// before that point can still deliver one more event, e.g. the
+		// disconnect the opponent's socket sees when our own Close() runs.
+		// Without this guard that would surface as a second, contradictory
+		// GameOverMsg -- "connection lost" appearing right after "you
+		// win!" -- since App matches on GameOverMsg's type regardless of
+		// which screen is active.
+		return m, nil
+	}
 	switch ev.Kind {
 	case network.GameEventMove:
 		if ev.Position >= 0 && ev.Position < len(m.board) && m.board[ev.Position] == Empty {

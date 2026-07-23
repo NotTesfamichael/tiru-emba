@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,6 +68,13 @@ type gameInviteAcceptedMsg struct {
 	err     error
 }
 
+// startLudoMsg signals that a local Ludo match should begin. Unlike a
+// tictactoe challenge, there's no network round-trip to wait on, so
+// handlePlayCommand requests the switch immediately, in the same keypress
+// that typed "/play ludo" -- App intercepts this the same way it intercepts
+// gameChallengeResultMsg/gameInviteAcceptedMsg to switch screens.
+type startLudoMsg struct{ numAI int }
+
 // gameChallengeResultMsg reports the outcome of an outgoing /play challenge.
 // Same split as gameInviteAcceptedMsg: App handles the accepted case (screen
 // switch), Model handles everything else (denied, timed out, failed to
@@ -77,6 +85,41 @@ type gameChallengeResultMsg struct {
 	accepted bool
 	reason   string
 	err      error
+}
+
+// ludoLobby tracks an in-flight, host-side "/play ludo @a @b ..." multi-
+// invite round: each target's SendGameInvite runs concurrently, and the
+// lobby is only ready once every target has responded -- accepted,
+// declined, or failed. All-or-nothing: if any target doesn't accept, the
+// whole match is aborted and any already-accepted sessions are closed,
+// rather than starting a partially-filled board.
+type ludoLobby struct {
+	targets    []string
+	sessions   []*network.GameSession // parallel to targets; nil until that target responds
+	resolved   []bool                 // parallel to targets
+	failReason string
+}
+
+// ludoChallengeResultMsg reports one target's response within a
+// multi-guest Ludo lobby, tagged by index into the lobby's target list so
+// results arriving out of order still land on the right slot.
+type ludoChallengeResultMsg struct {
+	idx      int
+	opponent string
+	session  *network.GameSession
+	accepted bool
+	reason   string
+	err      error
+}
+
+// startNetworkedLudoMsg signals that a Ludo lobby is fully ready: every
+// invited guest accepted, and their sessions (parallel to guestHandles, in
+// seat order Green/Yellow/Blue) are ready to hand off to ludo.NewHost. App
+// intercepts this to switch screens, the same way it does startLudoMsg for
+// the local-only mode.
+type startNetworkedLudoMsg struct {
+	guestHandles []string
+	sessions     []*network.GameSession
 }
 
 // pruneTickMsg fires periodically so the peer list drops teammates whose
@@ -104,6 +147,10 @@ type Model struct {
 	// Checked after fileOfferQueue so the two modal prompts never collide.
 	gameInviteQueue []network.GameInvite
 
+	// ludoLobby tracks an outstanding host-side "/play ludo @a @b ..."
+	// multi-invite round; nil whenever no such invite is in flight.
+	ludoLobby *ludoLobby
+
 	hist    *store.Store
 	history []store.Entry
 
@@ -113,9 +160,15 @@ type Model struct {
 	// handle.
 	filterPeer string
 
-	input       textinput.Model
-	suggestions []string
-	suggestIdx  int
+	// lastDMHandle is whoever we most recently exchanged a direct message
+	// with (sent to or received from), so pressing Up on an empty input
+	// can prefill "@handle " without retyping it.
+	lastDMHandle string
+
+	input          textinput.Model
+	suggestions    []string
+	cmdSuggestions []commandSpec
+	suggestIdx     int
 
 	width, height int
 }
@@ -288,6 +341,16 @@ func challengeToGame(ctx context.Context, addr, from, opponent, gameType string)
 	}
 }
 
+// challengeToLudoLobby is challengeToGame's counterpart for a multi-guest
+// Ludo lobby: same dial-and-wait, but tagged with idx so the result lands
+// on the right slot in ludoLobby regardless of response order.
+func challengeToLudoLobby(ctx context.Context, addr, from, opponent string, idx int) tea.Cmd {
+	return func() tea.Msg {
+		session, reason, err := network.SendGameInvite(ctx, addr, from, "ludo")
+		return ludoChallengeResultMsg{idx: idx, opponent: opponent, session: session, accepted: session != nil, reason: reason, err: err}
+	}
+}
+
 // recordEntry appends e to the in-memory history and (best-effort) persists
 // it to disk. KindSystem entries are session-only and never written to disk
 // (see store.Store.Append).
@@ -322,11 +385,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			return m.acceptSuggestion()
 		case "up":
+			if len(m.cmdSuggestions) > 0 {
+				m.suggestIdx = (m.suggestIdx - 1 + len(m.cmdSuggestions)) % len(m.cmdSuggestions)
+				return m, nil
+			}
 			if len(m.suggestions) > 0 {
 				m.suggestIdx = (m.suggestIdx - 1 + len(m.suggestions)) % len(m.suggestions)
 				return m, nil
 			}
+			if m.input.Value() == "" && m.lastDMHandle != "" {
+				m.input.SetValue(m.lastDMHandle + " ")
+				m.input.CursorEnd()
+				return m, nil
+			}
 		case "down":
+			if len(m.cmdSuggestions) > 0 {
+				m.suggestIdx = (m.suggestIdx + 1) % len(m.cmdSuggestions)
+				return m, nil
+			}
 			if len(m.suggestions) > 0 {
 				m.suggestIdx = (m.suggestIdx + 1) % len(m.suggestions)
 				return m, nil
@@ -354,7 +430,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.peers.Upsert(info)
 		if firstSighting {
-			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("%s joined", msg.Handle)))
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("%s %s joined", avatarForHandle(msg.Handle), msg.Handle)))
 		}
 		return m, waitForPeer(m.peerC)
 
@@ -365,6 +441,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Body: msg.Body,
 			At:   msg.At,
 		})
+		m.lastDMHandle = msg.From
 		notify.Alert(fmt.Sprintf("Message from %s", msg.From), msg.Body)
 		return m, waitForMessage(m.msgC)
 
@@ -427,6 +504,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case ludoChallengeResultMsg:
+		return m.handleLudoChallengeResult(msg)
+
 	case pruneTickMsg:
 		m.peers.Prune(time.Time(msg), discovery.PeerTTL)
 		return m, tea.Tick(pruneInterval, func(t time.Time) tea.Msg { return pruneTickMsg(t) })
@@ -439,8 +519,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // submitInput handles the Enter key: "/command ..." runs a command,
 // "@handle [@handle ...] body" resolves each handle against the peer
-// registry and delivers body to each over TCP, anything else is just a
-// local note (there's no group broadcast channel, only direct messages).
+// registry and delivers body to each over TCP, anything else broadcasts to
+// every currently online peer.
 func (m Model) submitInput() (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.input.Value())
 	if text == "" {
@@ -448,6 +528,7 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 	}
 	m.input.Reset()
 	m.suggestions = nil
+	m.cmdSuggestions = nil
 
 	switch {
 	case strings.HasPrefix(text, "/"):
@@ -455,9 +536,28 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 	case strings.HasPrefix(text, "@"):
 		return m.sendDirect(text)
 	default:
-		m.history = recordEntry(m.history, m.hist, store.Entry{Kind: store.KindSelfNote, Body: text, At: time.Now()})
+		return m.sendBroadcast(text)
+	}
+}
+
+// sendBroadcast delivers text to every currently online peer. There's no
+// shared broadcast channel on the wire -- this is really just the same
+// direct-message send fanned out to everyone the registry currently knows
+// about -- but from the user's side it reads as "just type to broadcast",
+// matching the input placeholder.
+func (m Model) sendBroadcast(text string) (tea.Model, tea.Cmd) {
+	m.history = recordEntry(m.history, m.hist, store.Entry{Kind: store.KindSelfNote, Body: text, At: time.Now()})
+
+	peers := m.peers.List()
+	if len(peers) == 0 {
 		return m, nil
 	}
+	cmds := make([]tea.Cmd, 0, len(peers))
+	for _, p := range peers {
+		addr := fmt.Sprintf("%s:%d", p.Addr, p.TCPPort)
+		cmds = append(cmds, sendMessage(addr, m.handle, p.Handle, text))
+	}
+	return m, tea.Batch(cmds...)
 }
 
 // sendDirect parses leading "@handle" tokens (however many appear before the
@@ -494,6 +594,7 @@ func (m Model) sendDirect(text string) (tea.Model, tea.Cmd) {
 			Body: body,
 			At:   time.Now(),
 		})
+		m.lastDMHandle = info.Handle
 		addr := fmt.Sprintf("%s:%d", info.Addr, info.TCPPort)
 		cmds = append(cmds, sendMessage(addr, m.handle, info.Handle, body))
 	}
@@ -611,9 +712,26 @@ func (m Model) handleGameInviteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// commandSpec documents one slash command for the "/" help/autocomplete
+// list and for "/help" itself, so both stay in sync with a single source
+// of truth instead of two hand-maintained lists drifting apart.
+type commandSpec struct {
+	usage string
+	desc  string
+}
+
+var commandSpecs = []commandSpec{
+	{"/play tictactoe @handle", "challenge a peer to Tic-Tac-Toe"},
+	{"/play ludo", "start a local Ludo match (you + AI opponents)"},
+	{"/play ludo @handle", "invite up to 3 peers to a networked Ludo match"},
+	{"/filter @handle", "show only your conversation with that peer"},
+	{"/clear", "clear the active filter"},
+	{"/help", "list every slash command"},
+}
+
 // handleCommand implements the slash-command set: /filter @handle (hide
-// everything except that conversation), /clear (show everything), and
-// /play tictactoe @handle (challenge a peer to a game).
+// everything except that conversation), /clear (show everything), /play
+// (challenge a peer or start a local game), and /help (list all of these).
 func (m Model) handleCommand(text string) (tea.Model, tea.Cmd) {
 	fields := strings.Fields(text)
 	switch strings.ToLower(fields[0]) {
@@ -634,50 +752,189 @@ func (m Model) handleCommand(text string) (tea.Model, tea.Cmd) {
 	case "/clear", "/unfilter":
 		m.filterPeer = ""
 		m.history = recordEntry(m.history, m.hist, systemNote("filter cleared"))
+	case "/help":
+		m.history = recordEntry(m.history, m.hist, systemNote("commands:"))
+		for _, c := range commandSpecs {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("  %-24s %s", c.usage, c.desc)))
+		}
 	default:
-		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("unknown command: %s", fields[0])))
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("unknown command: %s (try /help)", fields[0])))
 	}
 	return m, nil
 }
 
-// handlePlayCommand parses "/play tictactoe @handle" and, if the target is
-// online, issues the challenge. tictactoe is the only game so far, but the
-// explicit game-name argument keeps the command's shape ready for more.
+// handlePlayCommand implements "/play tictactoe @handle" (challenge a peer
+// over the network) and "/play ludo [2-4]" (start a local match against AI
+// opponents -- no network round-trip, so it switches screens immediately).
 func (m Model) handlePlayCommand(fields []string) (tea.Model, tea.Cmd) {
-	if len(fields) != 3 {
-		m.history = recordEntry(m.history, m.hist, systemNote("usage: /play tictactoe @handle"))
+	if len(fields) < 2 {
+		m.history = recordEntry(m.history, m.hist, systemNote("usage: /play tictactoe @handle | /play ludo [2-4]"))
 		return m, nil
 	}
-	game := strings.ToLower(fields[1])
-	target := fields[2]
-	if game != "tictactoe" {
-		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("unknown game: %s (only tictactoe for now)", fields[1])))
+
+	switch strings.ToLower(fields[1]) {
+	case "tictactoe":
+		if len(fields) != 3 {
+			m.history = recordEntry(m.history, m.hist, systemNote("usage: /play tictactoe @handle"))
+			return m, nil
+		}
+		target := fields[2]
+		info, ok := m.peers.Lookup(target)
+		if !ok {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("no such peer online: %s", target)))
+			return m, nil
+		}
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("challenging %s to tic-tac-toe, waiting for them to accept...", info.Handle)))
+		addr := fmt.Sprintf("%s:%d", info.Addr, info.TCPPort)
+		return m, challengeToGame(m.ctx, addr, m.handle, info.Handle, "tictactoe")
+
+	case "ludo":
+		args := fields[2:]
+		if len(args) > 0 && strings.HasPrefix(args[0], "@") {
+			return m.startLudoLobby(args)
+		}
+
+		numPlayers := 4
+		if len(args) >= 1 {
+			n, err := strconv.Atoi(args[0])
+			if err != nil || n < 2 || n > 4 {
+				m.history = recordEntry(m.history, m.hist, systemNote("usage: /play ludo [2-4] | /play ludo @handle [@handle ...] (up to 3)"))
+				return m, nil
+			}
+			numPlayers = n
+		}
+		numAI := numPlayers - 1
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("starting a local Ludo match: you + %d AI opponent(s)", numAI)))
+		return m, func() tea.Msg { return startLudoMsg{numAI: numAI} }
+
+	default:
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("unknown game: %s (try tictactoe or ludo)", fields[1])))
 		return m, nil
 	}
-	info, ok := m.peers.Lookup(target)
-	if !ok {
-		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("no such peer online: %s", target)))
-		return m, nil
-	}
-	m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("challenging %s to tic-tac-toe, waiting for them to accept...", info.Handle)))
-	addr := fmt.Sprintf("%s:%d", info.Addr, info.TCPPort)
-	return m, challengeToGame(m.ctx, addr, m.handle, info.Handle, "tictactoe")
 }
 
-// updateSuggestions recomputes the @handle autocomplete list from the
-// input's current last word. Only active while that word starts with "@"
-// and the cursor hasn't moved past it (approximated here by "no trailing
-// space yet").
+// startLudoLobby issues a networked Ludo invite to 1-3 online peers
+// concurrently. It's all-or-nothing: the match only starts once every
+// target has accepted (see handleLudoChallengeResult); if the lobby is
+// still waiting on responses, a new /play ludo @... is rejected rather
+// than starting a second, overlapping lobby.
+func (m Model) startLudoLobby(rawTargets []string) (tea.Model, tea.Cmd) {
+	if m.ludoLobby != nil {
+		m.history = recordEntry(m.history, m.hist, systemNote("a Ludo invite is already pending -- wait for it to resolve first"))
+		return m, nil
+	}
+	if len(rawTargets) > 3 {
+		m.history = recordEntry(m.history, m.hist, systemNote("usage: /play ludo @handle [@handle ...] (up to 3)"))
+		return m, nil
+	}
+
+	targets := make([]string, len(rawTargets))
+	addrs := make([]string, len(rawTargets))
+	for i, t := range rawTargets {
+		info, ok := m.peers.Lookup(t)
+		if !ok {
+			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("no such peer online: %s", t)))
+			return m, nil
+		}
+		targets[i] = info.Handle
+		addrs[i] = fmt.Sprintf("%s:%d", info.Addr, info.TCPPort)
+	}
+
+	cmds := make([]tea.Cmd, len(targets))
+	for i := range targets {
+		cmds[i] = challengeToLudoLobby(m.ctx, addrs[i], m.handle, targets[i], i)
+	}
+
+	m.ludoLobby = &ludoLobby{
+		targets:  targets,
+		sessions: make([]*network.GameSession, len(targets)),
+		resolved: make([]bool, len(targets)),
+	}
+	m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("inviting %s to Ludo, waiting for them to accept...", strings.Join(targets, ", "))))
+	return m, tea.Batch(cmds...)
+}
+
+// handleLudoChallengeResult records one target's response and, once every
+// target in the lobby has responded, either starts the match (everyone
+// accepted) or cancels it (closing any sessions that did accept, so nobody
+// is left waiting on a match that isn't going to start).
+func (m Model) handleLudoChallengeResult(msg ludoChallengeResultMsg) (tea.Model, tea.Cmd) {
+	lobby := m.ludoLobby
+	if lobby == nil || msg.idx >= len(lobby.resolved) {
+		return m, nil // a stale result from an already-resolved/abandoned lobby
+	}
+
+	lobby.resolved[msg.idx] = true
+	lobby.sessions[msg.idx] = msg.session
+	if !msg.accepted && lobby.failReason == "" {
+		reason := msg.reason
+		switch {
+		case msg.err != nil:
+			reason = msg.err.Error()
+		case reason == "":
+			reason = "declined"
+		}
+		lobby.failReason = fmt.Sprintf("%s: %s", msg.opponent, reason)
+	}
+
+	for _, resolved := range lobby.resolved {
+		if !resolved {
+			return m, nil // still waiting on the rest
+		}
+	}
+	m.ludoLobby = nil
+
+	if lobby.failReason != "" {
+		for _, sess := range lobby.sessions {
+			if sess != nil {
+				_ = sess.Resign()
+				_ = sess.Close()
+			}
+		}
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("Ludo invite canceled (%s)", lobby.failReason)))
+		return m, nil
+	}
+
+	m.history = recordEntry(m.history, m.hist, systemNote("everyone accepted -- starting the Ludo match"))
+	return m, func() tea.Msg {
+		return startNetworkedLudoMsg{guestHandles: lobby.targets, sessions: lobby.sessions}
+	}
+}
+
+// updateSuggestions recomputes whichever autocomplete list applies to the
+// input's current contents: matching slash commands while a "/word" is
+// still being typed (no space yet), matching @handles while the last word
+// starts with "@", or neither.
 func (m *Model) updateSuggestions() {
+	m.suggestions = nil
+	m.cmdSuggestions = nil
+
 	text := m.input.Value()
-	if text == "" || strings.HasSuffix(text, " ") {
-		m.suggestions = nil
+	if text == "" {
+		return
+	}
+
+	if strings.HasPrefix(text, "/") && !strings.Contains(text, " ") {
+		partial := strings.ToLower(text)
+		var matches []commandSpec
+		for _, c := range commandSpecs {
+			if strings.HasPrefix(strings.ToLower(c.usage), partial) {
+				matches = append(matches, c)
+			}
+		}
+		m.cmdSuggestions = matches
+		if m.suggestIdx >= len(matches) {
+			m.suggestIdx = 0
+		}
+		return
+	}
+
+	if strings.HasSuffix(text, " ") {
 		return
 	}
 	fields := strings.Fields(text)
 	last := fields[len(fields)-1]
 	if !strings.HasPrefix(last, "@") {
-		m.suggestions = nil
 		return
 	}
 
@@ -698,10 +955,32 @@ func (m *Model) updateSuggestions() {
 	}
 }
 
-// acceptSuggestion replaces the in-progress "@partial" word with the
-// selected suggestion. With no suggestions showing, Tab is just forwarded to
-// the input as normal.
+// acceptSuggestion fills in whichever suggestion is currently highlighted --
+// a full command template (usage string, ready to have its placeholder
+// edited) or an in-progress "@partial" handle. With nothing showing, Tab is
+// just forwarded to the input as normal.
 func (m Model) acceptSuggestion() (tea.Model, tea.Cmd) {
+	if len(m.cmdSuggestions) > 0 {
+		chosen := m.cmdSuggestions[m.suggestIdx]
+		m.cmdSuggestions = nil
+		m.suggestIdx = 0
+
+		value := chosen.usage
+		if strings.Contains(value, "@handle") {
+			// Leave a bare "@" rather than the literal "@handle" placeholder,
+			// with no trailing space, so it reads as an in-progress handle
+			// and immediately triggers the real @handle autocomplete below --
+			// picking who to actually play/filter with, not editing a
+			// placeholder word by hand.
+			m.input.SetValue(strings.Replace(value, "@handle", "@", 1))
+			m.input.CursorEnd()
+			m.updateSuggestions()
+			return m, nil
+		}
+		m.input.SetValue(value + " ")
+		m.input.CursorEnd()
+		return m, nil
+	}
 	if len(m.suggestions) == 0 {
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyTab})
@@ -773,6 +1052,18 @@ func (m Model) renderGameInvitePrompt() string {
 }
 
 func (m Model) renderSuggestions() string {
+	if len(m.cmdSuggestions) > 0 {
+		lines := make([]string, len(m.cmdSuggestions))
+		for i, c := range m.cmdSuggestions {
+			line := fmt.Sprintf("%-24s %s", c.usage, c.desc)
+			style := statusStyle
+			if i == m.suggestIdx {
+				style = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Underline(true)
+			}
+			lines[i] = style.Render(line)
+		}
+		return strings.Join(lines, "\n")
+	}
 	if len(m.suggestions) == 0 {
 		return ""
 	}
@@ -793,7 +1084,7 @@ func (m Model) renderSidebar(width, height int) string {
 	b.WriteString("\n\n")
 	for _, p := range m.peers.List() {
 		style := lipgloss.NewStyle().Foreground(colorForHandle(p.Handle))
-		line := "● " + p.Handle
+		line := avatarForHandle(p.Handle) + " " + p.Handle
 		if strings.EqualFold(strings.TrimPrefix(p.Handle, "@"), m.filterPeer) {
 			line += " [filter]"
 			style = style.Bold(true)

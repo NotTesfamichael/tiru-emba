@@ -55,6 +55,7 @@ type envelope struct {
 	GameType   string       `json:"game_type,omitempty"`
 	GameID     string       `json:"game_id,omitempty"`
 	Position   int          `json:"position,omitempty"`
+	Data       string       `json:"data,omitempty"`
 }
 
 func writeEnvelope(conn net.Conn, env envelope) error {
