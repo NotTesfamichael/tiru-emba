@@ -2,7 +2,10 @@
 
 Zero-configuration, LAN-only terminal chat. Run it on any machine on the same
 Wi-Fi network — teammates are discovered automatically via UDP multicast, no
-server, no config file.
+server, no config file. An optional [relay
+server](#cross-network-chat-relay-server) adds cross-network chat for
+teammates who aren't on that LAN, without changing anything about how LAN
+mode itself works.
 
 ## Installation
 
@@ -107,6 +110,68 @@ resignation), both sides drop back into chat with a note about how it went.
 
 More games are meant to build on this same foundation later, hence the
 explicit `tictactoe` argument in the command rather than a bare `/play @kal`.
+There's also a local Ludo mode (`/play ludo`, 2-4 players against simple AI
+opponents in the same terminal) and a networked one (`/play ludo @handle
+[@handle ...]`, up to 4 real players over LAN) — both LAN-only for now, see
+[Known limitations](#known-limitations) below.
+
+## Cross-network chat (relay server)
+
+LAN discovery only works when everyone's on the same Wi-Fi network. For
+teammates elsewhere, run a relay server somewhere reachable by everyone and
+point clients at it with `--server` — this is additive: a connected client
+sees LAN peers and relay teammates in the sidebar at the same time, in
+separate **LAN** and **Org** sections.
+
+### Running the server
+
+Needs a PostgreSQL database; the schema is created automatically on startup:
+
+```bash
+go build -o tiru-server ./cmd/tiru-server
+./tiru-server --addr=:8443 --db="postgres://user:pass@host:5432/dbname"
+```
+
+Pass `--tls-cert`/`--tls-key` for anything beyond local testing — without
+them the server runs in plaintext and warns loudly on startup, since
+passwords and session tokens would otherwise cross the network unencrypted.
+
+### Connecting a client
+
+```bash
+tiru-emba --handle=@alex --server=chat.example.com:8443 --server-register
+```
+
+`--server-register` creates a new account the first run; drop it on later
+runs to log into the existing one instead. Either way you're prompted for
+the account's password (masked, never echoed — separate from anything typed
+on the actual server machine). `--lan=false` skips LAN discovery entirely,
+for a relay-only client, or to avoid a UDP port conflict when running more
+than one `tiru-emba` instance on the same machine for testing.
+
+### Organizations
+
+There's no single global directory over the relay — you can only see or
+message someone you share an organization with. Whoever creates one becomes
+its admin:
+
+```
+/org create Acme        # you're now Acme's admin
+/org invite <id>        # generates a redeemable invite code, valid 7 days
+/org join <code>        # (a teammate, on their own client) redeems it
+/org list               # organizations you belong to
+```
+
+Once you share an org, that teammate appears in the sidebar's **Org**
+section, and `@handle` messages or a plain broadcast reach them the same way
+LAN peers already do.
+
+### Known limitations
+
+- `/play tictactoe`/`/play ludo`'s networked modes and file transfer are
+  LAN-only for now — none of them work over the relay yet.
+- One active connection per account at a time; logging in again elsewhere is
+  rejected rather than taking over the existing session.
 
 ## Troubleshooting: "Online (0)", teammates not showing up
 
