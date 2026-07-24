@@ -1,6 +1,8 @@
 // Command tiru-emba is a zero-configuration, LAN-only terminal chat client:
 // peer discovery over UDP multicast/broadcast, direct messaging over TCP,
-// and a Bubble Tea shell tying them together.
+// and a Bubble Tea shell tying them together. In relay mode (--server), it
+// additionally shows an in-TUI onboarding flow (Welcome -> Login/Register,
+// with a mandatory org-select step afterward) instead of a pre-TUI prompt.
 package main
 
 import (
@@ -11,25 +13,27 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"golang.org/x/term"
 
 	"github.com/NotTesfamichael/tiru-emba/internal/config"
 	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
 	"github.com/NotTesfamichael/tiru-emba/internal/filedrop"
 	"github.com/NotTesfamichael/tiru-emba/internal/network"
-	"github.com/NotTesfamichael/tiru-emba/internal/relay"
 	"github.com/NotTesfamichael/tiru-emba/internal/ui"
+	"github.com/NotTesfamichael/tiru-emba/internal/ui/onboarding"
 )
 
 func main() {
 	handle := flag.String("handle", "", `your display handle, e.g. "@alex" (registers it for next time; omit to reuse a saved handle, or run anonymously if none is saved)`)
 	tcpPort := flag.Int("port", 7777, "TCP port to listen on for direct messages")
 	serverAddr := flag.String("server", "", "relay server address (host:port) for cross-network chat -- omit to stay LAN-only")
-	serverRegister := flag.Bool("server-register", false, "register a new account on --server instead of logging into an existing one")
 	lanEnabled := flag.Bool("lan", true, "enable LAN discovery/chat; --lan=false runs relay-only, e.g. to avoid a UDP port conflict with another local instance")
+	backgroundNotification := flag.Bool("background-notification", false, "show OS desktop notifications for incoming messages/alerts (persisted for next time; omit to reuse the saved setting)")
 	flag.Parse()
+
+	notifyEnabled := resolveBackgroundNotification(*backgroundNotification)
 
 	if !*lanEnabled && *serverAddr == "" {
 		fmt.Fprintln(os.Stderr, "error: --lan=false with no --server would leave nothing to talk to")
@@ -40,26 +44,6 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
-	}
-
-	// Connect to the relay server (if requested) before starting the TUI,
-	// same reasoning as the LAN sockets below: a bad address or rejected
-	// login is a visible startup error, not something swallowed once
-	// Bubble Tea takes over the terminal. An anonymous handle (no @handle
-	// ever registered) can't usefully have a relay account either, since
-	// the relay identifies accounts by handle -- caught here rather than
-	// failing confusingly against the server.
-	var relayClient *relay.Client
-	if *serverAddr != "" {
-		if strings.HasPrefix(h, "@anon-") {
-			fmt.Fprintln(os.Stderr, "error: --server requires a registered handle (pass --handle=@you), not an anonymous one")
-			os.Exit(1)
-		}
-		relayClient, err = connectToRelay(*serverAddr, h, *serverRegister)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
 	}
 
 	selfID, err := randomID()
@@ -117,8 +101,23 @@ func main() {
 		go msgServer.Run(ctx, msgC, fileOfferC, fileResultC, gameInviteC)
 	}
 
-	chat := ui.New(ctx, selfID, h, peerC, msgC, fileOfferC, fileResultC, gameInviteC, relayClient)
-	app := ui.NewApp(chat)
+	chatArgs := ui.ChatArgs{
+		Ctx: ctx, SelfID: selfID,
+		PeerC: peerC, MsgC: msgC, OfferC: fileOfferC, ResultC: fileResultC, InviteC: gameInviteC,
+		NotifyEnabled: notifyEnabled,
+	}
+
+	var app tea.Model
+	if *serverAddr == "" {
+		writeNetworkStatus(*lanEnabled, false, "")
+		chat := ui.New(ctx, selfID, h, peerC, msgC, fileOfferC, fileResultC, gameInviteC, nil, notifyEnabled, nil, "")
+		app = ui.NewApp(chat)
+	} else {
+		writeNetworkStatus(*lanEnabled, false, *serverAddr)
+		onboard := onboarding.New(*serverAddr, h, resolveSavedToken(*serverAddr))
+		app = ui.NewAppWithOnboarding(onboard, chatArgs)
+	}
+
 	p := tea.NewProgram(app, tea.WithAltScreen())
 
 	final, err := p.Run()
@@ -131,65 +130,37 @@ func main() {
 	}
 }
 
-// connectToRelay dials addr and either registers a new account or logs
-// into an existing one for handle, prompting for the password (masked,
-// not echoed) synchronously before the TUI starts -- same reasoning as
-// resolveHandle's messages: a rejected login should be a visible startup
-// error, not something that surfaces confusingly once Bubble Tea owns the
-// terminal.
-func connectToRelay(addr, handle string, register bool) (*relay.Client, error) {
-	client, err := relay.Dial(addr)
-	if err != nil {
-		return nil, fmt.Errorf("could not connect to relay server %s: %w", addr, err)
+// resolveSavedToken returns a previously-persisted relay session token,
+// but only if it was issued for this same server address and hasn't
+// expired -- a token for a different --server (or a stale one) is
+// meaningless to try resuming, so onboarding just falls back to a normal
+// login in that case instead of failing confusingly against the server.
+func resolveSavedToken(serverAddr string) string {
+	cfg, err := config.Load()
+	if err != nil || cfg.ServerURL != serverAddr || cfg.SessionToken == "" {
+		return ""
 	}
-
-	action := "log in to"
-	if register {
-		action = "register"
+	if !cfg.SessionExpiresAt.After(time.Now()) {
+		return ""
 	}
-	fmt.Printf("password to %s %s on %s: ", action, handle, addr)
-	password, err := promptPassword()
-	if err != nil {
-		client.Close()
-		return nil, fmt.Errorf("could not read password: %w", err)
-	}
-
-	if register {
-		_, _, err = client.Register(handle, password)
-	} else {
-		_, _, err = client.Login(handle, password)
-	}
-	if err != nil {
-		client.Close()
-		return nil, fmt.Errorf("relay authentication failed: %w", err)
-	}
-	return client, nil
-}
-
-// promptPassword reads one line from stdin without echoing it to the
-// terminal (via golang.org/x/term), printing a trailing newline afterward
-// since the Enter keypress itself isn't echoed either.
-func promptPassword() (string, error) {
-	b, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Println()
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
+	return cfg.SessionToken
 }
 
 // resolveHandle implements a lightweight "registration" flow: an explicit
 // --handle registers itself for next time (saved to config), no flag reuses
 // a previously-registered handle silently, and with neither, a random
 // anonymous handle is generated -- and deliberately not persisted, so every
-// anonymous run gets a fresh one rather than "registering" anonymity.
+// anonymous run gets a fresh one rather than "registering" anonymity. This
+// is always the LAN discovery identity; in relay mode it also pre-fills
+// (editable) the onboarding Login/Register handle field, so a normal run
+// keeps a single consistent identity across both without forcing one.
 func resolveHandle(flagValue string) (string, error) {
 	h := strings.TrimSpace(flagValue)
 	if h != "" {
 		if !strings.HasPrefix(h, "@") {
 			h = "@" + h
 		}
-		if err := config.Save(config.Config{Handle: h}); err != nil {
+		if err := config.Update(func(c *config.Config) { c.Handle = h }); err != nil {
 			fmt.Fprintln(os.Stderr, "warning: could not save handle for next time:", err)
 		}
 		return h, nil
@@ -210,6 +181,61 @@ func resolveHandle(flagValue string) (string, error) {
 	fmt.Fprintf(os.Stderr, "no handle registered -- joining anonymously as %s\n", anon)
 	fmt.Fprintln(os.Stderr, "hint: pass --handle=@you once to register a permanent handle for next time")
 	return anon, nil
+}
+
+// resolveBackgroundNotification mirrors resolveHandle's "explicit flag wins
+// and is persisted; otherwise reuse the saved setting" pattern, using
+// flag.Visit to tell an explicitly-passed "--background-notification=false"
+// apart from the flag simply not being passed at all (flag.Bool's own
+// default is indistinguishable from an explicit false otherwise).
+func resolveBackgroundNotification(flagValue bool) bool {
+	explicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "background-notification" {
+			explicit = true
+		}
+	})
+	if explicit {
+		if err := config.Update(func(c *config.Config) { c.BackgroundNotification = flagValue }); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not save notification setting for next time:", err)
+		}
+		return flagValue
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not read saved notification setting:", err)
+		return false
+	}
+	return cfg.BackgroundNotification
+}
+
+// writeNetworkStatus persists a best-effort snapshot of this run's network
+// state to config.json (lan_status/wlan_status/server_url) -- purely
+// informational, read by external tooling/inspection rather than by
+// tiru-emba itself on a later run, so a failure here is just a warning.
+// wlan_status starts "disconnected" here and is flipped to "connected"
+// from within the onboarding flow (internal/ui) once relay auth actually
+// succeeds, since that isn't known synchronously anymore.
+func writeNetworkStatus(lanEnabled, relayConnected bool, serverAddr string) {
+	lanStatus := "disconnected"
+	if lanEnabled {
+		lanStatus = "connected"
+	}
+	wlanStatus := "disconnected"
+	if relayConnected {
+		wlanStatus = "connected"
+	}
+	err := config.Update(func(c *config.Config) {
+		c.LANStatus = lanStatus
+		c.WLANStatus = wlanStatus
+		if serverAddr != "" {
+			c.ServerURL = serverAddr
+		}
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not save network status:", err)
+	}
 }
 
 func randomID() (string, error) {

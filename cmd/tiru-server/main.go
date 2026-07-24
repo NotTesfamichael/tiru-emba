@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/NotTesfamichael/tiru-emba/internal/relay"
@@ -21,6 +22,7 @@ func main() {
 	dbURL := flag.String("db", "", `PostgreSQL connection string, e.g. "postgres://user:pass@host:5432/dbname" (required)`)
 	certFile := flag.String("tls-cert", "", "path to a TLS certificate; without it the server runs WITHOUT TLS (dev/local only)")
 	keyFile := flag.String("tls-key", "", "path to the TLS certificate's private key (required alongside --tls-cert)")
+	adminHandles := flag.String("admin-handle", "", "comma-separated handle(s), e.g. \"@alex,@sam\", to grant admin (only admins can create organizations) -- the account must already be registered; safe to pass on every restart")
 	flag.Parse()
 
 	if *dbURL == "" {
@@ -60,8 +62,19 @@ func main() {
 	}
 
 	auth := relay.NewAuth(store)
+	for _, handle := range strings.Split(*adminHandles, ",") {
+		handle = strings.TrimSpace(handle)
+		if handle == "" {
+			continue
+		}
+		if err := auth.PromoteToAdmin(ctx, handle); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not promote", handle, "to admin:", err)
+		}
+	}
 	orgs := relay.NewOrgs(store)
-	srv, err := relay.NewServer(*addr, auth, orgs, tlsConfig)
+	points := relay.NewPoints(store)
+	todos := relay.NewTodos(store, points)
+	srv, err := relay.NewServer(*addr, auth, orgs, points, todos, tlsConfig)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

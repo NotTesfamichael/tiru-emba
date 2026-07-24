@@ -2,6 +2,9 @@ package ui
 
 import (
 	"context"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,24 @@ import (
 	"github.com/NotTesfamichael/tiru-emba/internal/store"
 )
 
+func writeTestPNG(t *testing.T, path string) {
+	t.Helper()
+	img := image.NewGray(image.Rect(0, 0, 4, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			img.SetGray(x, y, color.Gray{Y: uint8(x * 60)})
+		}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create test image: %v", err)
+	}
+	defer f.Close()
+	if err := png.Encode(f, img); err != nil {
+		t.Fatalf("encode test image: %v", err)
+	}
+}
+
 func newTestModel(t *testing.T) Model {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir()) // sandbox history persistence away from the real user's home
@@ -21,7 +42,7 @@ func newTestModel(t *testing.T) Model {
 	offerC := make(chan network.FileOffer)
 	resultC := make(chan network.FileResult)
 	inviteC := make(chan network.GameInvite)
-	return New(context.Background(), "self-id", "@me", peerC, msgC, offerC, resultC, inviteC, nil)
+	return New(context.Background(), "self-id", "@me", peerC, msgC, offerC, resultC, inviteC, nil, false, nil, "")
 }
 
 func TestSendDirectMultiTarget(t *testing.T) {
@@ -262,5 +283,83 @@ func TestUpdateSuggestionsPrefixMatch(t *testing.T) {
 	m.updateSuggestions()
 	if len(m.suggestions) != 0 {
 		t.Error("expected no suggestions once a trailing space closes the handle token")
+	}
+}
+
+func TestImagePreviewNoteForRealImage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photo.png")
+	writeTestPNG(t, path)
+
+	entry, ok := imagePreviewNote(path)
+	if !ok {
+		t.Fatal("expected a preview for a real PNG")
+	}
+	if entry.Body == "" {
+		t.Error("expected a non-empty ASCII art body")
+	}
+}
+
+func TestImagePreviewNoteSkipsNonImageExtension(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := imagePreviewNote(path); ok {
+		t.Error("expected no preview for a non-image extension")
+	}
+}
+
+func TestImagePreviewNoteSkipsUndecodableImage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fake.png")
+	if err := os.WriteFile(path, []byte("not actually a png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := imagePreviewNote(path); ok {
+		t.Error("expected no preview for a file that doesn't actually decode as an image")
+	}
+}
+
+func TestSendFileToTargetsAppendsImagePreview(t *testing.T) {
+	m := newTestModel(t)
+	m.peers.Upsert(peer.Info{ID: "1", Handle: "@kal", Addr: "127.0.0.1", TCPPort: 1})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photo.png")
+	writeTestPNG(t, path)
+
+	newModel, _ := m.sendFileToTargets([]string{"@kal"}, path)
+	m = newModel.(Model)
+
+	found := false
+	for _, e := range m.history {
+		if e.Kind == store.KindSystem && e.Body != "" && strings.Contains(e.Body, "\n") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a multi-line ASCII-art preview entry in history after sending an image")
+	}
+}
+
+func TestFileResultMsgAppendsImagePreviewOnReceive(t *testing.T) {
+	m := newTestModel(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "received.png")
+	writeTestPNG(t, path)
+
+	newModel, _ := m.Update(fileResultMsg{From: "@kal", FileName: "received.png", SavedPath: path})
+	m = newModel.(Model)
+
+	found := false
+	for _, e := range m.history {
+		if e.Kind == store.KindSystem && strings.Contains(e.Body, "\n") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected an ASCII-art preview entry in history after receiving an image")
 	}
 }

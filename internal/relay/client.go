@@ -160,29 +160,105 @@ func (c *Client) request(env Envelope) (Envelope, error) {
 	}
 }
 
-// Register creates a new account and, on success, is auto-logged-in --
-// same as Login, just also creating the account first.
-func (c *Client) Register(handle, password string) (token string, expiresAt time.Time, err error) {
-	reply, err := c.request(Envelope{Type: MsgAuthRegister, Handle: handle, Password: password})
+// Register creates a new account -- with an optional ASCII avatar and
+// security question/answer for later recovery, either of which may be
+// passed empty to skip -- and, on success, is auto-logged-in the same as
+// Login.
+func (c *Client) Register(handle, password, avatarASCII, securityQuestion, securityAnswer string) (token string, expiresAt time.Time, isAdmin bool, err error) {
+	reply, err := c.request(Envelope{
+		Type: MsgAuthRegister, Handle: handle, Password: password,
+		AvatarASCII: avatarASCII, SecurityQuestion: securityQuestion, SecurityAnswer: securityAnswer,
+	})
 	if err != nil {
-		return "", time.Time{}, err
+		return "", time.Time{}, false, err
 	}
-	if reply.Type == MsgAuthError {
-		return "", time.Time{}, errors.New(reply.Reason)
+	if reply.Type != MsgAuthToken {
+		return "", time.Time{}, false, unexpectedReply(reply)
 	}
-	return reply.Token, reply.ExpiresAt, nil
+	return reply.Token, reply.ExpiresAt, reply.IsAdmin, nil
 }
 
 // Login authenticates an existing account.
-func (c *Client) Login(handle, password string) (token string, expiresAt time.Time, err error) {
+func (c *Client) Login(handle, password string) (token string, expiresAt time.Time, isAdmin bool, err error) {
 	reply, err := c.request(Envelope{Type: MsgAuthLogin, Handle: handle, Password: password})
 	if err != nil {
-		return "", time.Time{}, err
+		return "", time.Time{}, false, err
 	}
-	if reply.Type == MsgAuthError {
-		return "", time.Time{}, errors.New(reply.Reason)
+	if reply.Type != MsgAuthToken {
+		return "", time.Time{}, false, unexpectedReply(reply)
 	}
-	return reply.Token, reply.ExpiresAt, nil
+	return reply.Token, reply.ExpiresAt, reply.IsAdmin, nil
+}
+
+// ResumeSession re-authenticates with a previously-issued token instead of
+// a handle/password, returning a freshly-rotated token -- what lets a
+// client stay logged in automatically across restarts. Must be called on
+// a freshly-dialed, not-yet-authenticated connection, the same as
+// Login/Register -- calling it on a connection that already authenticated
+// hits the server's generic "unknown message type" handling instead of
+// MsgAuthError, which unexpectedReply still correctly surfaces as an error
+// rather than silently returning a zero-valued token.
+func (c *Client) ResumeSession(token string) (newToken string, expiresAt time.Time, isAdmin bool, err error) {
+	reply, err := c.request(Envelope{Type: MsgAuthResume, Token: token})
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	if reply.Type != MsgAuthToken {
+		return "", time.Time{}, false, unexpectedReply(reply)
+	}
+	return reply.Token, reply.ExpiresAt, reply.IsAdmin, nil
+}
+
+// RecoverStart begins the "forgot password" flow, returning the security
+// question registered for handle.
+func (c *Client) RecoverStart(handle string) (question string, err error) {
+	reply, err := c.request(Envelope{Type: MsgAuthRecoverStart, Handle: handle})
+	if err != nil {
+		return "", err
+	}
+	if reply.Type != MsgAuthRecoverQuestion {
+		return "", unexpectedReply(reply)
+	}
+	return reply.SecurityQuestion, nil
+}
+
+// RecoverFinish completes password recovery and, on success, is
+// auto-logged-in with a fresh session, the same as Register.
+func (c *Client) RecoverFinish(handle, answer, newPassword string) (token string, expiresAt time.Time, isAdmin bool, err error) {
+	reply, err := c.request(Envelope{Type: MsgAuthRecoverFinish, Handle: handle, SecurityAnswer: answer, Password: newPassword})
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	if reply.Type != MsgAuthToken {
+		return "", time.Time{}, false, unexpectedReply(reply)
+	}
+	return reply.Token, reply.ExpiresAt, reply.IsAdmin, nil
+}
+
+// CheckHandle reports whether handle is already registered -- meant for
+// registration to validate the handle right after it's typed, instead of
+// only failing at final submission.
+func (c *Client) CheckHandle(handle string) (available bool, err error) {
+	reply, err := c.request(Envelope{Type: MsgCheckHandle, Handle: handle})
+	if err != nil {
+		return false, err
+	}
+	if reply.Type != MsgHandleCheckResult {
+		return false, unexpectedReply(reply)
+	}
+	return reply.Available, nil
+}
+
+// unexpectedReply turns any non-success reply into an error, preferring
+// its Reason (set on both MsgAuthError and the generic MsgError) over a
+// bare "wrong message type" description -- covers not just the expected
+// error type but any other unexpected reply, so a protocol-level surprise
+// can never silently look like success with zero-valued fields.
+func unexpectedReply(reply Envelope) error {
+	if reply.Reason != "" {
+		return errors.New(reply.Reason)
+	}
+	return fmt.Errorf("relay: unexpected reply type %q", reply.Type)
 }
 
 // CreateOrg creates a new org with the caller as its first member/admin.
@@ -240,4 +316,108 @@ func (c *Client) JoinOrg(code string) (OrgSummary, error) {
 // confirmation, and failures surface later via Events instead.
 func (c *Client) SendRelay(to, body string) error {
 	return c.write(Envelope{Type: MsgRelay, To: to, Body: body})
+}
+
+// AccountBio bundles the stats an /account bio screen shows.
+type AccountBio struct {
+	Handle      string
+	AvatarASCII string
+	Points      int
+	OrgNames    []string
+	CreatedAt   time.Time
+}
+
+// Bio fetches the caller's own account stats.
+func (c *Client) Bio() (AccountBio, error) {
+	reply, err := c.request(Envelope{Type: MsgAccountBio})
+	if err != nil {
+		return AccountBio{}, err
+	}
+	if reply.Type == MsgError {
+		return AccountBio{}, errors.New(reply.Reason)
+	}
+	return AccountBio{
+		Handle:      reply.Handle,
+		AvatarASCII: reply.AvatarASCII,
+		Points:      reply.Points,
+		OrgNames:    reply.OrgNames,
+		CreatedAt:   reply.CreatedAt,
+	}, nil
+}
+
+// ListUnlockables returns the full unlockables catalog, annotated with
+// which the caller already owns/has equipped.
+func (c *Client) ListUnlockables() ([]UnlockableInfo, error) {
+	reply, err := c.request(Envelope{Type: MsgUnlockablesList})
+	if err != nil {
+		return nil, err
+	}
+	if reply.Type == MsgError {
+		return nil, errors.New(reply.Reason)
+	}
+	return reply.Unlockables, nil
+}
+
+// RedeemUnlockable spends points to unlock unlockableID.
+func (c *Client) RedeemUnlockable(unlockableID int64) error {
+	reply, err := c.request(Envelope{Type: MsgUnlockableRedeem, UnlockableID: unlockableID})
+	if err != nil {
+		return err
+	}
+	if reply.Type == MsgError {
+		return errors.New(reply.Reason)
+	}
+	return nil
+}
+
+// SetAvatar equips an already-redeemed unlockable as the caller's active
+// avatar/border.
+func (c *Client) SetAvatar(unlockableID int64) error {
+	reply, err := c.request(Envelope{Type: MsgAvatarSet, UnlockableID: unlockableID})
+	if err != nil {
+		return err
+	}
+	if reply.Type == MsgError {
+		return errors.New(reply.Reason)
+	}
+	return nil
+}
+
+// ListTodos returns every shared todo in orgID.
+func (c *Client) ListTodos(orgID int64) ([]TodoInfo, error) {
+	reply, err := c.request(Envelope{Type: MsgTodoList, OrgID: orgID})
+	if err != nil {
+		return nil, err
+	}
+	if reply.Type == MsgError {
+		return nil, errors.New(reply.Reason)
+	}
+	return reply.Todos, nil
+}
+
+// AddTodo creates a new shared todo in orgID.
+func (c *Client) AddTodo(orgID int64, text string) (TodoInfo, error) {
+	reply, err := c.request(Envelope{Type: MsgTodoAdd, OrgID: orgID, Text: text})
+	if err != nil {
+		return TodoInfo{}, err
+	}
+	if reply.Type == MsgError {
+		return TodoInfo{}, errors.New(reply.Reason)
+	}
+	if reply.Todo == nil {
+		return TodoInfo{}, fmt.Errorf("relay: server accepted the todo but returned none")
+	}
+	return *reply.Todo, nil
+}
+
+// CompleteTodo marks todoID (in orgID) done.
+func (c *Client) CompleteTodo(orgID, todoID int64) error {
+	reply, err := c.request(Envelope{Type: MsgTodoComplete, OrgID: orgID, TodoID: todoID})
+	if err != nil {
+		return err
+	}
+	if reply.Type == MsgError {
+		return errors.New(reply.Reason)
+	}
+	return nil
 }

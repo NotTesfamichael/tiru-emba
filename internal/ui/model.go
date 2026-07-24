@@ -14,14 +14,44 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/NotTesfamichael/tiru-emba/internal/asciiart"
 	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
 	"github.com/NotTesfamichael/tiru-emba/internal/filedrop"
 	"github.com/NotTesfamichael/tiru-emba/internal/network"
 	"github.com/NotTesfamichael/tiru-emba/internal/notify"
 	"github.com/NotTesfamichael/tiru-emba/internal/peer"
 	"github.com/NotTesfamichael/tiru-emba/internal/relay"
+	"github.com/NotTesfamichael/tiru-emba/internal/shellpath"
 	"github.com/NotTesfamichael/tiru-emba/internal/store"
 )
+
+// imagePreviewCols is how wide (in terminal columns) a sent/received photo
+// is rendered as ASCII art in the chat transcript.
+const imagePreviewCols = 40
+
+// imageExtensions is checked against a file's extension (case-insensitive)
+// to decide whether to attempt an ASCII-art preview -- there's no MIME
+// type available anywhere in the file-transfer protocol (see
+// internal/network's FileOffer/FileResult), only a filename.
+var imageExtensions = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true,
+}
+
+// imagePreviewNote renders path as ASCII art for the chat transcript, if
+// its extension looks like an image and it actually decodes as one.
+// Best-effort and silent on any failure (unsupported format, corrupt
+// file, unreadable path) -- a missing preview never blocks the underlying
+// file send/receive, which already succeeded by the time this runs.
+func imagePreviewNote(path string) (store.Entry, bool) {
+	if !imageExtensions[strings.ToLower(filepath.Ext(path))] {
+		return store.Entry{}, false
+	}
+	art, err := asciiart.FromFile(path, imagePreviewCols)
+	if err != nil {
+		return store.Entry{}, false
+	}
+	return store.Entry{Kind: store.KindSystem, Body: art, At: time.Now()}, true
+}
 
 // relayClient is what Model needs from a relay.Client -- narrowed to an
 // interface so it can be tested against a fake instead of a real
@@ -36,6 +66,15 @@ type relayClient interface {
 	SendRelay(to, body string) error
 	Events() <-chan relay.Envelope
 	Close() error
+
+	Bio() (relay.AccountBio, error)
+	ListUnlockables() ([]relay.UnlockableInfo, error)
+	RedeemUnlockable(unlockableID int64) error
+	SetAvatar(unlockableID int64) error
+
+	ListTodos(orgID int64) ([]relay.TodoInfo, error)
+	AddTodo(orgID int64, text string) (relay.TodoInfo, error)
+	CompleteTodo(orgID, todoID int64) error
 }
 
 const (
@@ -199,6 +238,13 @@ type Model struct {
 	relay    relayClient
 	orgMates map[string]bool
 
+	// currentOrgID/currentOrgName are the org chosen at the mandatory
+	// org-select screen (internal/ui/orgselect) that always runs before
+	// Model in relay mode -- nil/"" in LAN-only mode. Scopes /todo's
+	// shared (org) todos and is shown in the sidebar.
+	currentOrgID   *int64
+	currentOrgName string
+
 	hist    *store.Store
 	history []store.Entry
 
@@ -219,6 +265,28 @@ type Model struct {
 	suggestIdx     int
 
 	width, height int
+
+	// notifyEnabled gates every notify.Alert call behind the
+	// --background-notification flag/setting -- off by default so a
+	// terminal in the foreground isn't also popping OS notifications for
+	// the messages already visible on screen.
+	notifyEnabled bool
+}
+
+// welcomeMessage builds the first system note shown in a fresh session --
+// pulled out of New as its own pure function so the org-ID-in-brackets
+// logic is testable without needing a real *relay.Client (New only accepts
+// the concrete type, not a fake, per its own doc comment below).
+func welcomeMessage(handle string, connected bool, orgID *int64, orgName string) string {
+	welcome := fmt.Sprintf("welcome, %s. discovering teammates on the LAN...", handle)
+	if !connected {
+		return welcome
+	}
+	orgIDStr := ""
+	if orgID != nil {
+		orgIDStr = fmt.Sprintf(" [%d]", *orgID)
+	}
+	return welcome + fmt.Sprintf(" connected to the relay server, org %q%s.", orgName, orgIDStr)
 }
 
 // New constructs the chat model. relayC is nil for LAN-only mode; when
@@ -229,7 +297,7 @@ type Model struct {
 // avoids the classic Go "typed nil interface" trap: a nil *relay.Client
 // stored directly into an interface-typed field would make that field
 // compare != nil even though nothing is actually there.
-func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen, msgC <-chan network.Received, offerC <-chan network.FileOffer, resultC <-chan network.FileResult, inviteC <-chan network.GameInvite, relayC *relay.Client) Model {
+func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.PeerSeen, msgC <-chan network.Received, offerC <-chan network.FileOffer, resultC <-chan network.FileResult, inviteC <-chan network.GameInvite, relayC *relay.Client, notifyEnabled bool, orgID *int64, orgName string) Model {
 	ti := textinput.New()
 	ti.Placeholder = "@handle your message, or just type to broadcast..."
 	ti.Focus()
@@ -240,10 +308,7 @@ func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.Peer
 
 	history := make([]store.Entry, 0, len(saved)+2)
 	history = append(history, saved...)
-	welcome := fmt.Sprintf("welcome, %s. discovering teammates on the LAN...", handle)
-	if relayC != nil {
-		welcome += " connected to the relay server."
-	}
+	welcome := welcomeMessage(handle, relayC != nil, orgID, orgName)
 	history = append(history, store.Entry{Kind: store.KindSystem, Body: welcome, At: time.Now()})
 	if err != nil {
 		history = append(history, store.Entry{
@@ -254,19 +319,22 @@ func New(ctx context.Context, selfID, handle string, peerC <-chan discovery.Peer
 	}
 
 	m := Model{
-		ctx:      ctx,
-		selfID:   selfID,
-		handle:   handle,
-		peers:    peer.NewRegistry(),
-		peerC:    peerC,
-		msgC:     msgC,
-		offerC:   offerC,
-		resultC:  resultC,
-		inviteC:  inviteC,
-		orgMates: make(map[string]bool),
-		hist:     hist,
-		history:  history,
-		input:    ti,
+		ctx:            ctx,
+		selfID:         selfID,
+		handle:         handle,
+		peers:          peer.NewRegistry(),
+		peerC:          peerC,
+		msgC:           msgC,
+		offerC:         offerC,
+		resultC:        resultC,
+		inviteC:        inviteC,
+		orgMates:       make(map[string]bool),
+		currentOrgID:   orgID,
+		currentOrgName: orgName,
+		hist:           hist,
+		history:        history,
+		input:          ti,
+		notifyEnabled:  notifyEnabled,
 	}
 	if relayC != nil {
 		m.relay = relayC
@@ -562,7 +630,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			At:   msg.At,
 		})
 		m.lastDMHandle = msg.From
-		notify.Alert(fmt.Sprintf("Message from %s", msg.From), msg.Body)
+		if m.notifyEnabled {
+			notify.Alert(fmt.Sprintf("Message from %s", msg.From), msg.Body)
+		}
 		return m, waitForMessage(m.msgC)
 
 	case sendResultMsg:
@@ -580,7 +650,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("failed to receive %s from %s: %v", msg.FileName, msg.From, msg.Err)))
 		} else {
 			m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("received %s from %s -> saved to %s", msg.FileName, msg.From, msg.SavedPath)))
-			notify.Alert(fmt.Sprintf("File from %s", msg.From), fmt.Sprintf("%s saved to %s", msg.FileName, filedrop.DirName))
+			if preview, ok := imagePreviewNote(msg.SavedPath); ok {
+				m.history = recordEntry(m.history, m.hist, preview)
+			}
+			if m.notifyEnabled {
+				notify.Alert(fmt.Sprintf("File from %s", msg.From), fmt.Sprintf("%s saved to %s", msg.FileName, filedrop.DirName))
+			}
 		}
 		return m, waitForFileResult(m.resultC)
 
@@ -775,6 +850,9 @@ func (m Model) sendFileToTargets(targets []string, path string) (tea.Model, tea.
 			"%s (%s) exceeds the %s limit", filepath.Base(path), network.HumanSize(info.Size()), network.HumanSize(network.MaxFileSize))))
 		return m, nil
 	}
+	if preview, ok := imagePreviewNote(path); ok {
+		m.history = recordEntry(m.history, m.hist, preview)
+	}
 
 	var cmds []tea.Cmd
 	for _, target := range targets {
@@ -794,43 +872,14 @@ func (m Model) sendFileToTargets(targets []string, path string) (tea.Model, tea.
 // filePathIn recognizes a message body that's actually a dropped file path.
 // Dragging a file onto a terminal inserts its absolute path as literal text,
 // and terminals disagree on how they escape spaces/special characters in
-// that path: some wrap the whole thing in matching quotes, others (e.g.
-// Ghostty) backslash-escape each special character shell-style instead, so
-// "My Photo.png" arrives as `My\ Photo.png`. Both are handled here.
+// that path -- see internal/shellpath, which handles it (shared with
+// onboarding's profile-picture prompt, which hits the exact same quirk).
 func filePathIn(body string) (string, bool) {
-	body = strings.TrimSpace(body)
-	if len(body) >= 2 {
-		if (body[0] == '\'' && body[len(body)-1] == '\'') || (body[0] == '"' && body[len(body)-1] == '"') {
-			body = body[1 : len(body)-1]
-		} else {
-			body = unescapeShellPath(body)
-		}
-	}
-	if body == "" {
+	path, ok := shellpath.Resolve(body)
+	if !ok {
 		return "", false
 	}
-	info, err := os.Stat(body)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", false
-	}
-	return body, true
-}
-
-// unescapeShellPath undoes shell-style backslash escaping: a backslash
-// followed by any character is replaced with just that character.
-func unescapeShellPath(s string) string {
-	if !strings.ContainsRune(s, '\\') {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) {
-			i++
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
+	return path, true
 }
 
 // handleOfferKey is the modal key handler while a file-transfer prompt is
@@ -892,8 +941,20 @@ var commandSpecs = []commandSpec{
 	{"/org list", "list the organizations you belong to -- requires --server"},
 	{"/org invite <id>", "generate an invite code for an org you admin -- requires --server"},
 	{"/org join <code>", "redeem an invite code to join an org -- requires --server"},
+	{"/account bio", "view your handle, avatar, points, and orgs"},
+	{"/todo", "open the todo screen (personal, plus shared with your org if connected)"},
+	{"/todo add <text>", "quickly add a personal todo without opening the screen"},
 	{"/help", "list every slash command"},
 }
+
+// openAccountMsg tells the hosting router (internal/ui.App) to switch to
+// the full-screen account view -- emitted by handleAccountCommand instead
+// of handled inline, the same "sub-model emits a typed Msg; the router
+// swaps the active screen" pattern used for games (see app.go).
+type openAccountMsg struct{}
+
+// openTodoMsg mirrors openAccountMsg for the full-screen todo view.
+type openTodoMsg struct{}
 
 // handleCommand implements the slash-command set: /filter @handle (hide
 // everything except that conversation), /clear (show everything), /play
@@ -906,6 +967,10 @@ func (m Model) handleCommand(text string) (tea.Model, tea.Cmd) {
 		return m.handlePlayCommand(fields)
 	case "/org":
 		return m.handleOrgCommand(fields)
+	case "/account":
+		return m.handleAccountCommand(fields)
+	case "/todo":
+		return m.handleTodoCommand(fields)
 	case "/filter":
 		if len(fields) < 2 {
 			m.history = recordEntry(m.history, m.hist, systemNote("usage: /filter @handle"))
@@ -983,6 +1048,55 @@ func (m Model) handleOrgCommand(fields []string) (tea.Model, tea.Cmd) {
 		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("unknown /org subcommand: %s (try create, list, invite, join)", fields[1])))
 		return m, nil
 	}
+}
+
+// handleAccountCommand implements "/account bio". Unlike /org, it's still
+// meaningful with no relay connection (LAN-only mode) -- it just shows a
+// smaller local-only summary inline instead of refusing outright, since a
+// handle and a deterministic avatar exist either way; points/orgs/the
+// unlockables shop only exist with a relay connection, so those open the
+// fuller account.Model screen instead (via openAccountMsg, which the
+// hosting router intercepts).
+func (m Model) handleAccountCommand(fields []string) (tea.Model, tea.Cmd) {
+	if len(fields) < 2 || strings.ToLower(fields[1]) != "bio" {
+		m.history = recordEntry(m.history, m.hist, systemNote("usage: /account bio"))
+		return m, nil
+	}
+	if m.relay == nil {
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf(
+			"handle: %s   avatar: %s   (LAN-only mode -- connect with --server to see points, orgs, and unlockables)",
+			m.handle, avatarForHandle(m.handle),
+		)))
+		return m, nil
+	}
+	return m, func() tea.Msg { return openAccountMsg{} }
+}
+
+// handleTodoCommand implements "/todo" (open the full-screen todo view,
+// personal + shared-with-org) and "/todo add <text>" (a quick personal-only
+// shortcut that skips opening the screen entirely -- todos are meaningful
+// in LAN-only mode too, unlike /org and the fuller /account bio screen,
+// since the personal list never needs a relay connection).
+func (m Model) handleTodoCommand(fields []string) (tea.Model, tea.Cmd) {
+	if len(fields) == 1 {
+		return m, func() tea.Msg { return openTodoMsg{} }
+	}
+	if strings.ToLower(fields[1]) != "add" || len(fields) < 3 {
+		m.history = recordEntry(m.history, m.hist, systemNote("usage: /todo | /todo add <text>"))
+		return m, nil
+	}
+	text := strings.Join(fields[2:], " ")
+	ts, items, err := store.OpenTodos(m.handle)
+	if err != nil {
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("could not open your todo list: %v", err)))
+		return m, nil
+	}
+	if _, _, err := ts.Add(items, text); err != nil {
+		m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("could not save todo: %v", err)))
+		return m, nil
+	}
+	m.history = recordEntry(m.history, m.hist, systemNote(fmt.Sprintf("added personal todo: %s", text)))
+	return m, nil
 }
 
 // handlePlayCommand implements "/play tictactoe @handle" (challenge a peer
@@ -1149,7 +1263,9 @@ func (m Model) handleRelayEvent(msg relayEventMsg) (tea.Model, tea.Cmd) {
 			At:   time.Now(),
 		})
 		m.lastDMHandle = ev.Handle
-		notify.Alert(fmt.Sprintf("Message from %s", ev.Handle), ev.Body)
+		if m.notifyEnabled {
+			notify.Alert(fmt.Sprintf("Message from %s", ev.Handle), ev.Body)
+		}
 
 	case relay.MsgError:
 		// An unsolicited error, e.g. a fire-and-forget SendRelay that
@@ -1203,6 +1319,17 @@ func (m *Model) updateSuggestions() {
 		return
 	}
 
+	// Once the "/org invite" subcommand itself is typed, suggest the
+	// user's actual current org ID instead of leaving them to hand-edit a
+	// bare "<id>" placeholder they have no way to look up otherwise (the
+	// ID is now also shown in the sidebar and the startup message, but a
+	// ready-to-use suggestion here is the more common escape hatch).
+	if spec, ok := m.orgArgSuggestion(text); ok {
+		m.cmdSuggestions = []commandSpec{spec}
+		m.suggestIdx = 0
+		return
+	}
+
 	if strings.HasPrefix(text, "/") && !strings.Contains(text, " ") {
 		partial := strings.ToLower(text)
 		var matches []commandSpec
@@ -1247,6 +1374,29 @@ func (m *Model) updateSuggestions() {
 	if m.suggestIdx >= len(matches) {
 		m.suggestIdx = 0
 	}
+}
+
+// orgArgSuggestion returns a single ready-to-use suggestion for
+// "/org invite", once that subcommand itself has been typed: the actual
+// ID of the org the user is currently in, rather than a generic "<id>"
+// placeholder they'd otherwise have no way to fill in correctly.
+func (m Model) orgArgSuggestion(text string) (commandSpec, bool) {
+	if m.relay == nil || m.currentOrgID == nil {
+		return commandSpec{}, false
+	}
+	const prefix = "/org invite"
+	if !strings.HasPrefix(strings.ToLower(text), prefix) {
+		return commandSpec{}, false
+	}
+	arg := strings.TrimSpace(text[len(prefix):])
+	idStr := fmt.Sprintf("%d", *m.currentOrgID)
+	if arg != "" && !strings.HasPrefix(idStr, arg) {
+		return commandSpec{}, false
+	}
+	return commandSpec{
+		usage: fmt.Sprintf("/org invite %d", *m.currentOrgID),
+		desc:  fmt.Sprintf("your current org: %s", m.currentOrgName),
+	}, true
 }
 
 // acceptSuggestion fills in whichever suggestion is currently highlighted --
@@ -1386,7 +1536,14 @@ func (m Model) renderSidebar(width, height int) string {
 
 	if m.relay != nil {
 		b.WriteString("\n")
-		b.WriteString(sidebarHeaderStyle.Render(fmt.Sprintf("Org (%d)", len(m.orgMates))))
+		orgLabel := fmt.Sprintf("Org (%d)", len(m.orgMates))
+		if m.currentOrgName != "" {
+			orgLabel = fmt.Sprintf("%s (%d)", m.currentOrgName, len(m.orgMates))
+			if m.currentOrgID != nil {
+				orgLabel = fmt.Sprintf("%s [%d] (%d)", m.currentOrgName, *m.currentOrgID, len(m.orgMates))
+			}
+		}
+		b.WriteString(sidebarHeaderStyle.Render(orgLabel))
 		b.WriteString("\n\n")
 		mates := make([]string, 0, len(m.orgMates))
 		for h := range m.orgMates {

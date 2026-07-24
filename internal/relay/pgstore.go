@@ -26,8 +26,13 @@ CREATE TABLE IF NOT EXISTS users (
 	id            BIGSERIAL PRIMARY KEY,
 	handle        TEXT NOT NULL UNIQUE,
 	password_hash TEXT NOT NULL,
-	created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+	created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+	is_admin      BOOLEAN NOT NULL DEFAULT false
 );
+-- ADD COLUMN IF NOT EXISTS covers a users table that already existed
+-- before is_admin was added (CREATE TABLE IF NOT EXISTS above only helps
+-- a brand new database) -- see the schema doc comment on migrations.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS sessions (
 	token      TEXT PRIMARY KEY,
@@ -61,6 +66,52 @@ CREATE TABLE IF NOT EXISTS org_invites (
 	max_uses   INT NOT NULL DEFAULT 1,
 	used_count INT NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS unlockables (
+	id        BIGSERIAL PRIMARY KEY,
+	name      TEXT NOT NULL UNIQUE,
+	kind      TEXT NOT NULL,
+	ascii_art TEXT NOT NULL,
+	cost      INT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_profiles (
+	user_id              BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+	avatar_ascii         TEXT NOT NULL DEFAULT '',
+	security_question    TEXT NOT NULL DEFAULT '',
+	security_answer_hash TEXT NOT NULL DEFAULT '',
+	points               INT NOT NULL DEFAULT 0,
+	active_unlockable_id BIGINT REFERENCES unlockables(id)
+);
+
+CREATE TABLE IF NOT EXISTS user_unlocks (
+	user_id       BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	unlockable_id BIGINT NOT NULL REFERENCES unlockables(id) ON DELETE CASCADE,
+	unlocked_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (user_id, unlockable_id)
+);
+
+CREATE TABLE IF NOT EXISTS todos (
+	id         BIGSERIAL PRIMARY KEY,
+	org_id     BIGINT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	created_by BIGINT NOT NULL REFERENCES users(id),
+	text       TEXT NOT NULL,
+	done       BOOLEAN NOT NULL DEFAULT false,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	done_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS todos_org_id_idx ON todos(org_id);
+
+-- Seed a small starter catalog. ON CONFLICT DO NOTHING keeps this
+-- idempotent across every Migrate() call the same way the CREATE TABLE
+-- statements above are.
+INSERT INTO unlockables (name, kind, ascii_art, cost) VALUES
+	('Shades',    'avatar', '(⌐■_■)',           5),
+	('Robot',     'avatar', '[■_■]',            10),
+	('Star-Eyed', 'avatar', '(✪‿✪)',           15),
+	('Royal',     'border', '*/////////////*',  20),
+	('Sparkle',   'border', '.:*~*:._.:*~*:.',  25)
+ON CONFLICT (name) DO NOTHING;
 `
 
 // PGStore is the PostgreSQL-backed Store, using a connection pool (pgxpool)
@@ -104,9 +155,9 @@ func (s *PGStore) CreateUser(ctx context.Context, handle, passwordHash string) (
 	var u User
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO users (handle, password_hash) VALUES ($1, $2)
-		 RETURNING id, handle, password_hash, created_at`,
+		 RETURNING id, handle, password_hash, created_at, is_admin`,
 		handle, passwordHash,
-	).Scan(&u.ID, &u.Handle, &u.PasswordHash, &u.CreatedAt)
+	).Scan(&u.ID, &u.Handle, &u.PasswordHash, &u.CreatedAt, &u.IsAdmin)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
@@ -120,9 +171,9 @@ func (s *PGStore) CreateUser(ctx context.Context, handle, passwordHash string) (
 func (s *PGStore) UserByHandle(ctx context.Context, handle string) (User, error) {
 	var u User
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, handle, password_hash, created_at FROM users WHERE handle = $1`,
+		`SELECT id, handle, password_hash, created_at, is_admin FROM users WHERE handle = $1`,
 		handle,
-	).Scan(&u.ID, &u.Handle, &u.PasswordHash, &u.CreatedAt)
+	).Scan(&u.ID, &u.Handle, &u.PasswordHash, &u.CreatedAt, &u.IsAdmin)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
@@ -130,6 +181,14 @@ func (s *PGStore) UserByHandle(ctx context.Context, handle string) (User, error)
 		return User{}, fmt.Errorf("relay: query user: %w", err)
 	}
 	return u, nil
+}
+
+func (s *PGStore) PromoteToAdmin(ctx context.Context, handle string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE users SET is_admin = true WHERE handle = $1`, handle)
+	if err != nil {
+		return fmt.Errorf("relay: promote to admin: %w", err)
+	}
+	return nil
 }
 
 func (s *PGStore) CreateSession(ctx context.Context, userID int64, token string, expiresAt time.Time) error {
@@ -147,11 +206,11 @@ func (s *PGStore) UserBySessionToken(ctx context.Context, token string) (User, t
 	var u User
 	var expiresAt time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT u.id, u.handle, u.password_hash, u.created_at, s.expires_at
+		`SELECT u.id, u.handle, u.password_hash, u.created_at, u.is_admin, s.expires_at
 		 FROM sessions s JOIN users u ON u.id = s.user_id
 		 WHERE s.token = $1`,
 		token,
-	).Scan(&u.ID, &u.Handle, &u.PasswordHash, &u.CreatedAt, &expiresAt)
+	).Scan(&u.ID, &u.Handle, &u.PasswordHash, &u.CreatedAt, &u.IsAdmin, &expiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, time.Time{}, ErrNotFound
 	}
@@ -349,4 +408,217 @@ func (s *PGStore) RedeemOrgInvite(ctx context.Context, code string, userID int64
 		return Org{}, fmt.Errorf("relay: redeem org invite: %w", err)
 	}
 	return org, nil
+}
+
+func (s *PGStore) CreateUserProfile(ctx context.Context, userID int64, avatarASCII, securityQuestion, securityAnswerHash string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO user_profiles (user_id, avatar_ascii, security_question, security_answer_hash)
+		 VALUES ($1, $2, $3, $4)`,
+		userID, avatarASCII, securityQuestion, securityAnswerHash,
+	)
+	if err != nil {
+		return fmt.Errorf("relay: create user profile: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) ProfileByUserID(ctx context.Context, userID int64) (UserProfile, error) {
+	p := UserProfile{UserID: userID}
+	err := s.pool.QueryRow(ctx,
+		`SELECT avatar_ascii, security_question, security_answer_hash, points, active_unlockable_id
+		 FROM user_profiles WHERE user_id = $1`,
+		userID,
+	).Scan(&p.AvatarASCII, &p.SecurityQuestion, &p.SecurityAnswerHash, &p.Points, &p.ActiveUnlockableID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return UserProfile{}, ErrNotFound
+	}
+	if err != nil {
+		return UserProfile{}, fmt.Errorf("relay: query user profile: %w", err)
+	}
+	return p, nil
+}
+
+func (s *PGStore) AddPoints(ctx context.Context, userID int64, delta int) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE user_profiles SET points = points + $1 WHERE user_id = $2`,
+		delta, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("relay: add points: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) UpdatePassword(ctx context.Context, userID int64, newPasswordHash string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE users SET password_hash = $1 WHERE id = $2`,
+		newPasswordHash, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("relay: update password: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) ListUnlockables(ctx context.Context) ([]Unlockable, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, name, kind, ascii_art, cost FROM unlockables ORDER BY cost, name`)
+	if err != nil {
+		return nil, fmt.Errorf("relay: query unlockables: %w", err)
+	}
+	defer rows.Close()
+
+	var result []Unlockable
+	for rows.Next() {
+		var u Unlockable
+		if err := rows.Scan(&u.ID, &u.Name, &u.Kind, &u.AsciiArt, &u.Cost); err != nil {
+			return nil, fmt.Errorf("relay: scan unlockable: %w", err)
+		}
+		result = append(result, u)
+	}
+	return result, rows.Err()
+}
+
+func (s *PGStore) UnlockedIDs(ctx context.Context, userID int64) (map[int64]bool, error) {
+	rows, err := s.pool.Query(ctx, `SELECT unlockable_id FROM user_unlocks WHERE user_id = $1`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("relay: query unlocked ids: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64]bool)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("relay: scan unlock id: %w", err)
+		}
+		result[id] = true
+	}
+	return result, rows.Err()
+}
+
+func (s *PGStore) RedeemUnlockable(ctx context.Context, userID, unlockableID int64) error {
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var cost int
+		if err := tx.QueryRow(ctx, `SELECT cost FROM unlockables WHERE id = $1`, unlockableID).Scan(&cost); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+
+		var alreadyUnlocked bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM user_unlocks WHERE user_id = $1 AND unlockable_id = $2)`,
+			userID, unlockableID,
+		).Scan(&alreadyUnlocked); err != nil {
+			return err
+		}
+		if alreadyUnlocked {
+			return ErrAlreadyUnlocked
+		}
+
+		var points int
+		if err := tx.QueryRow(ctx,
+			`SELECT points FROM user_profiles WHERE user_id = $1 FOR UPDATE`, userID,
+		).Scan(&points); err != nil {
+			return err
+		}
+		if points < cost {
+			return ErrInsufficientPoints
+		}
+
+		if _, err := tx.Exec(ctx,
+			`UPDATE user_profiles SET points = points - $1 WHERE user_id = $2`, cost, userID,
+		); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx,
+			`INSERT INTO user_unlocks (user_id, unlockable_id) VALUES ($1, $2)`, userID, unlockableID,
+		)
+		return err
+	})
+	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrAlreadyUnlocked) || errors.Is(err, ErrInsufficientPoints) {
+		return err
+	}
+	if err != nil {
+		return fmt.Errorf("relay: redeem unlockable: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) SetActiveUnlockable(ctx context.Context, userID int64, unlockableID *int64) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE user_profiles SET active_unlockable_id = $1 WHERE user_id = $2`,
+		unlockableID, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("relay: set active unlockable: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) IsOrgMember(ctx context.Context, orgID, userID int64) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2)`,
+		orgID, userID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("relay: query org membership: %w", err)
+	}
+	return exists, nil
+}
+
+func (s *PGStore) CreateTodo(ctx context.Context, orgID, createdByUserID int64, createdByHandle, text string) (TodoInfo, error) {
+	t := TodoInfo{CreatedBy: createdByHandle}
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO todos (org_id, created_by, text) VALUES ($1, $2, $3)
+		 RETURNING id, text, done, created_at`,
+		orgID, createdByUserID, text,
+	).Scan(&t.ID, &t.Text, &t.Done, &t.CreatedAt)
+	if err != nil {
+		return TodoInfo{}, fmt.Errorf("relay: create todo: %w", err)
+	}
+	return t, nil
+}
+
+func (s *PGStore) ListTodos(ctx context.Context, orgID int64) ([]TodoInfo, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT t.id, t.text, t.done, t.created_at, u.handle
+		 FROM todos t JOIN users u ON u.id = t.created_by
+		 WHERE t.org_id = $1 ORDER BY t.created_at`,
+		orgID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("relay: query todos: %w", err)
+	}
+	defer rows.Close()
+
+	var result []TodoInfo
+	for rows.Next() {
+		var t TodoInfo
+		if err := rows.Scan(&t.ID, &t.Text, &t.Done, &t.CreatedAt, &t.CreatedBy); err != nil {
+			return nil, fmt.Errorf("relay: scan todo: %w", err)
+		}
+		result = append(result, t)
+	}
+	return result, rows.Err()
+}
+
+func (s *PGStore) CompleteTodo(ctx context.Context, orgID, todoID int64) (TodoInfo, error) {
+	var t TodoInfo
+	err := s.pool.QueryRow(ctx,
+		`UPDATE todos SET done = true, done_at = now()
+		 WHERE id = $1 AND org_id = $2
+		 RETURNING id, text, done, created_at,
+		   (SELECT handle FROM users WHERE id = todos.created_by)`,
+		todoID, orgID,
+	).Scan(&t.ID, &t.Text, &t.Done, &t.CreatedAt, &t.CreatedBy)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TodoInfo{}, ErrNotFound
+	}
+	if err != nil {
+		return TodoInfo{}, fmt.Errorf("relay: complete todo: %w", err)
+	}
+	return t, nil
 }

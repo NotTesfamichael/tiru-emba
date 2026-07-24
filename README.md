@@ -125,35 +125,74 @@ separate **LAN** and **Org** sections.
 
 ### Running the server
 
-Needs a PostgreSQL database; the schema is created automatically on startup:
+Needs a PostgreSQL database; the schema (including a small seeded
+unlockables catalog, see [Gamification](#gamification-todo-and-account-bio)
+below) is created automatically on startup.
+
+**Locally, for testing** (Postgres already installed and running):
 
 ```bash
+createdb tiru_emba_dev                      # one-time, if it doesn't exist yet
 go build -o tiru-server ./cmd/tiru-server
-./tiru-server --addr=:8443 --db="postgres://user:pass@host:5432/dbname"
+go build .                                  # the tiru-emba client itself
+
+./tiru-server --addr=127.0.0.1:8443 --db="postgres://localhost:5432/tiru_emba_dev?sslmode=disable"
 ```
 
-Pass `--tls-cert`/`--tls-key` for anything beyond local testing — without
-them the server runs in plaintext and warns loudly on startup, since
+No `--tls-cert`/`--tls-key` needed for this — plaintext is fine on
+`localhost`, and the server just prints a warning about it. In another
+terminal:
+
+```bash
+./tiru-emba --server=127.0.0.1:8443
+```
+
+That drops you on the Welcome screen against your own local server — pick
+Register, go through the wizard, create an org, and you're in chat. Repeat
+in a third terminal with a different handle to test two accounts talking to
+each other (`--handle=@someoneelse --server=127.0.0.1:8443`), or run
+`./tiru-emba --handle=@you` with no `--server` at all to test LAN-only mode
+by itself.
+
+For anything beyond your own machine, pass `--tls-cert`/`--tls-key` —
+without them the server runs in plaintext and warns loudly on startup, since
 passwords and session tokens would otherwise cross the network unencrypted.
+See [Deploying to a VM with your own domain](#deploying-to-a-vm-with-your-own-domain)
+below for getting a real certificate.
 
 ### Connecting a client
 
 ```bash
-tiru-emba --handle=@alex --server=chat.example.com:8443 --server-register
+tiru-emba --handle=@alex --server=chat.example.com:8443
 ```
 
-`--server-register` creates a new account the first run; drop it on later
-runs to log into the existing one instead. Either way you're prompted for
-the account's password (masked, never echoed — separate from anything typed
-on the actual server machine). `--lan=false` skips LAN discovery entirely,
-for a relay-only client, or to avoid a UDP port conflict when running more
-than one `tiru-emba` instance on the same machine for testing.
+`--handle` here just seeds your LAN identity and pre-fills the relay
+login/register form — it isn't a separate account flag. On launch you land
+on a **Welcome** screen (Log in / Register / Forgot password):
+
+- **Register** asks for a username, password, a *local file path* to a
+  profile picture (converted to an ASCII avatar automatically — leave it
+  blank to skip), and an optional security question for later recovery.
+- **Log in** just needs the handle/password for an existing account.
+- **Forgot password** asks for the handle, shows the security question you
+  set at registration, and lets you set a new password from the answer (only
+  available if you set one — skipping it at registration means no recovery).
+- A previously-successful login is remembered (`~/.tiru-emba/config.json`)
+  and resumed automatically on the next launch, without re-entering a
+  password — but you're always asked to pick an organization on every
+  launch, even then, since a resumed session doesn't imply which org should
+  be active.
+
+`--lan=false` skips LAN discovery entirely, for a relay-only client, or to
+avoid a UDP port conflict when running more than one `tiru-emba` instance on
+the same machine for testing.
 
 ### Organizations
 
 There's no single global directory over the relay — you can only see or
-message someone you share an organization with. Whoever creates one becomes
-its admin:
+message someone you share an organization with. The first screen after
+logging in lets you create a new one or join an existing one with an invite
+code; from inside chat, the same is available via commands:
 
 ```
 /org create Acme        # you're now Acme's admin
@@ -166,12 +205,128 @@ Once you share an org, that teammate appears in the sidebar's **Org**
 section, and `@handle` messages or a plain broadcast reach them the same way
 LAN peers already do.
 
+### Gamification, todo, and account bio
+
+- **Points**: sending a relay message or completing a shared todo earns a
+  few points, tracked server-side per account.
+- **`/account bio`**: your handle, ASCII avatar, points, and orgs. In
+  relay mode this opens a full screen that also lets you browse and redeem
+  a small catalog of unlockable ASCII avatars/borders with those points, and
+  equip whichever one you've unlocked. In LAN-only mode (no `--server`) it
+  just prints a smaller local-only summary inline, since points/orgs/the
+  shop don't exist without a server.
+- **`/todo`**: opens a full-screen task list — a personal section (stored
+  locally, works with or without a server) and, once you're in an org, a
+  shared section visible/editable by everyone in it. `/todo add <text>` is
+  a quick shortcut that adds a personal item without opening the screen.
+
 ### Known limitations
 
 - `/play tictactoe`/`/play ludo`'s networked modes and file transfer are
   LAN-only for now — none of them work over the relay yet.
 - One active connection per account at a time; logging in again elsewhere is
   rejected rather than taking over the existing session.
+
+## Deploying to a VM with your own domain
+
+This walks through putting `tiru-server` on a real machine with a real
+domain and a real TLS certificate, rather than running it on `localhost` for
+local testing.
+
+### 1. Get a VM and point DNS at it
+
+Any provider works (DigitalOcean, Hetzner, a free-tier AWS/GCP instance,
+etc.) — you just need a public IPv4 address and SSH access. Ubuntu/Debian
+is assumed below. Once you have the IP, create an **A record** for the
+subdomain you want (e.g. `chat.yourdomain.com` → `203.0.113.10`) with
+whoever hosts your domain's DNS, and wait for it to propagate (`dig
+chat.yourdomain.com` should return that IP).
+
+### 2. Install Postgres and Go, build the server
+
+On the VM:
+
+```bash
+sudo apt update && sudo apt install -y postgresql golang-go git
+sudo -u postgres createuser tiru_emba
+sudo -u postgres createdb tiru_emba -O tiru_emba
+sudo -u postgres psql -c "ALTER USER tiru_emba WITH PASSWORD 'pick-a-real-password';"
+
+git clone https://github.com/NotTesfamichael/tiru-emba /opt/tiru-emba
+cd /opt/tiru-emba && go build -o /usr/local/bin/tiru-server ./cmd/tiru-server
+```
+
+(A managed Postgres instance from your cloud provider works too — just
+point `--db` at it instead of installing Postgres locally.)
+
+### 3. Get a real TLS certificate (Let's Encrypt)
+
+`tiru-server` reads a plain cert/key file pair — no built-in ACME client —
+so [certbot](https://certbot.eff.org)'s standalone mode is the simplest way
+to get one, since `tiru-server` itself doesn't need port 80:
+
+```bash
+sudo apt install -y certbot
+sudo certbot certonly --standalone -d chat.yourdomain.com
+# certs land in /etc/letsencrypt/live/chat.yourdomain.com/{fullchain,privkey}.pem
+```
+
+Those files are root-owned and only readable by root, so either run
+`tiru-server` as root (simplest, fine for a small self-hosted server), or add
+a certbot [deploy
+hook](https://eff-certbot.readthedocs.io/en/stable/using.html#renewal) that
+copies the renewed cert somewhere your service user can read and restarts
+the service. Certbot auto-renews via a systemd timer it installs itself
+(`systemctl list-timers | grep certbot`) — no separate cron job needed.
+
+### 4. Run it as a systemd service
+
+`/etc/systemd/system/tiru-server.service`:
+
+```ini
+[Unit]
+Description=tiru-emba relay server
+After=network.target postgresql.service
+
+[Service]
+ExecStart=/usr/local/bin/tiru-server \
+  --addr=:8443 \
+  --db=postgres://tiru_emba:pick-a-real-password@localhost:5432/tiru_emba?sslmode=disable \
+  --tls-cert=/etc/letsencrypt/live/chat.yourdomain.com/fullchain.pem \
+  --tls-key=/etc/letsencrypt/live/chat.yourdomain.com/privkey.pem
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now tiru-server
+sudo journalctl -u tiru-server -f   # watch it start, confirm "listening on"
+```
+
+### 5. Open the firewall
+
+```bash
+sudo ufw allow 8443/tcp   # or your cloud provider's security-group/firewall UI
+```
+
+(Port 80 only needs to be open transiently for certbot's standalone
+challenge — it doesn't need to stay open for `tiru-server` itself, which
+only uses `--addr`'s port.)
+
+### 6. Connect from a client, anywhere
+
+```bash
+tiru-emba --handle=@alex --server=chat.yourdomain.com:8443
+```
+
+No VPN, no shared Wi-Fi needed — this works from any network. Everything
+under [Connecting a client](#connecting-a-client) above (the Welcome
+screen, accounts, orgs) applies the same way against a real deployed server
+as it does against `localhost`.
 
 ## Troubleshooting: "Online (0)", teammates not showing up
 

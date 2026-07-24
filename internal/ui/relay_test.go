@@ -54,6 +54,19 @@ func (f *fakeRelayClient) SendRelay(to, body string) error {
 func (f *fakeRelayClient) Events() <-chan relay.Envelope { return f.events }
 func (f *fakeRelayClient) Close() error                  { f.closed = true; return nil }
 
+func (f *fakeRelayClient) Bio() (relay.AccountBio, error) { return relay.AccountBio{}, nil }
+func (f *fakeRelayClient) ListUnlockables() ([]relay.UnlockableInfo, error) {
+	return nil, nil
+}
+func (f *fakeRelayClient) RedeemUnlockable(unlockableID int64) error { return nil }
+func (f *fakeRelayClient) SetAvatar(unlockableID int64) error        { return nil }
+
+func (f *fakeRelayClient) ListTodos(orgID int64) ([]relay.TodoInfo, error) { return nil, nil }
+func (f *fakeRelayClient) AddTodo(orgID int64, text string) (relay.TodoInfo, error) {
+	return relay.TodoInfo{}, nil
+}
+func (f *fakeRelayClient) CompleteTodo(orgID, todoID int64) error { return nil }
+
 // newTestModelWithRelay mirrors newTestModel but wires in a fakeRelayClient
 // directly (bypassing New, the same way the game packages' fake-session
 // tests construct their Models directly via struct literal).
@@ -279,5 +292,62 @@ func TestOrgCommandInviteRejectsNonNumericID(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected a usage system note")
+	}
+}
+
+func TestSidebarShowsCurrentOrgID(t *testing.T) {
+	fake := newFakeRelayClient()
+	m := newTestModelWithRelay(t, fake)
+	orgID := int64(350)
+	m.currentOrgID = &orgID
+	m.currentOrgName = "Acme"
+	m.width, m.height = 100, 40
+
+	view := m.View()
+	if !strings.Contains(view, "Acme [350]") {
+		t.Errorf("expected the sidebar to show %q, view:\n%s", "Acme [350]", view)
+	}
+}
+
+func TestWelcomeMessageShowsCurrentOrgID(t *testing.T) {
+	orgID := int64(42)
+	msg := welcomeMessage("@me", true, &orgID, "Acme")
+	if !strings.Contains(msg, "Acme") || !strings.Contains(msg, "[42]") {
+		t.Errorf("welcomeMessage = %q, want it to mention org %q [42]", msg, "Acme")
+	}
+}
+
+func TestWelcomeMessageLANOnlyOmitsOrgInfo(t *testing.T) {
+	msg := welcomeMessage("@me", false, nil, "")
+	if strings.Contains(msg, "relay server") {
+		t.Errorf("welcomeMessage = %q, want no relay/org mention when not connected", msg)
+	}
+}
+
+func TestOrgArgSuggestionFillsInCurrentOrgID(t *testing.T) {
+	fake := newFakeRelayClient()
+	m := newTestModelWithRelay(t, fake)
+	orgID := int64(350)
+	m.currentOrgID = &orgID
+	m.currentOrgName = "Acme"
+
+	m.input.SetValue("/org invite")
+	m.updateSuggestions()
+	if len(m.cmdSuggestions) != 1 {
+		t.Fatalf("cmdSuggestions = %+v, want exactly one", m.cmdSuggestions)
+	}
+	if m.cmdSuggestions[0].usage != "/org invite 350" {
+		t.Errorf("suggestion usage = %q, want %q", m.cmdSuggestions[0].usage, "/org invite 350")
+	}
+}
+
+func TestOrgArgSuggestionAbsentWithoutCurrentOrg(t *testing.T) {
+	fake := newFakeRelayClient()
+	m := newTestModelWithRelay(t, fake) // no currentOrgID set
+
+	m.input.SetValue("/org invite")
+	m.updateSuggestions()
+	if len(m.cmdSuggestions) != 0 {
+		t.Errorf("expected no org-id suggestion without a current org, got %+v", m.cmdSuggestions)
 	}
 }

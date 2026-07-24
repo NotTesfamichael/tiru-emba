@@ -1,14 +1,17 @@
 package ui
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/NotTesfamichael/tiru-emba/internal/discovery"
 	"github.com/NotTesfamichael/tiru-emba/internal/games/tictactoe"
 	"github.com/NotTesfamichael/tiru-emba/internal/network"
 	"github.com/NotTesfamichael/tiru-emba/internal/store"
+	"github.com/NotTesfamichael/tiru-emba/internal/ui/orgselect"
 )
 
 func TestAppStartsOnChatScreen(t *testing.T) {
@@ -112,5 +115,42 @@ func TestAppKeepsChatDimensionsFreshDuringGame(t *testing.T) {
 
 	if a.chat.width != 120 || a.chat.height != 40 {
 		t.Errorf("chat dimensions = %dx%d, want 120x40 (should update even while the game screen is active)", a.chat.width, a.chat.height)
+	}
+}
+
+// TestChatModelGetsSizeImmediatelyAfterOrgSelect is a regression test for a
+// real bug caught via live/manual testing: the chat Model built once
+// org-select finishes was constructed well after Bubble Tea's one-time
+// startup tea.WindowSizeMsg already fired, so it never received a size of
+// its own and rendered "initializing..." forever.
+func TestChatModelGetsSizeImmediatelyAfterOrgSelect(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	app := App{
+		screen: screenOrgSelect,
+		chatArgs: ChatArgs{
+			Ctx:     context.Background(),
+			SelfID:  "self-id",
+			PeerC:   make(chan discovery.PeerSeen),
+			MsgC:    make(chan network.Received),
+			OfferC:  make(chan network.FileOffer),
+			ResultC: make(chan network.FileResult),
+			InviteC: make(chan network.GameInvite),
+		},
+		authHandle: "@me",
+		width:      120,
+		height:     40,
+	}
+
+	newApp, _ := app.Update(orgselect.SelectedMsg{OrgID: 7, OrgName: "Acme"})
+	a := newApp.(App)
+
+	if a.screen != screenChat {
+		t.Fatalf("screen = %v, want screenChat", a.screen)
+	}
+	if a.chat.width != 120 || a.chat.height != 40 {
+		t.Errorf("chat dimensions = %dx%d, want 120x40 immediately after org-select, not left at zero", a.chat.width, a.chat.height)
+	}
+	if view := a.View(); strings.Contains(view, "initializing") {
+		t.Errorf("chat screen still shows the zero-size placeholder right after org-select: %q", view)
 	}
 }

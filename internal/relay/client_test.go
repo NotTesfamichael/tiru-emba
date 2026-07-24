@@ -14,7 +14,7 @@ func TestClientRegisterAndLogin(t *testing.T) {
 	}
 	defer c.Close()
 
-	token, expiresAt, err := c.Register("@clientalex", "correct horse battery")
+	token, expiresAt, _, err := c.Register("@clientalex", "correct horse battery", "", "", "")
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -26,7 +26,7 @@ func TestClientRegisterAndLogin(t *testing.T) {
 	}
 }
 
-func TestClientLoginWrongPassword(t *testing.T) {
+func TestClientCheckHandle(t *testing.T) {
 	addr := startTestServer(t)
 
 	c, err := Dial(addr.String())
@@ -34,7 +34,16 @@ func TestClientLoginWrongPassword(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer c.Close()
-	if _, _, err := c.Register("@clientbob", "correct horse battery"); err != nil {
+
+	available, err := c.CheckHandle("@freshhandle")
+	if err != nil {
+		t.Fatalf("CheckHandle: %v", err)
+	}
+	if !available {
+		t.Error("expected @freshhandle to be available")
+	}
+
+	if _, _, _, err := c.Register("@freshhandle", "correct horse battery", "", "", ""); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	c.Close()
@@ -44,7 +53,34 @@ func TestClientLoginWrongPassword(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer c2.Close()
-	if _, _, err := c2.Login("@clientbob", "wrong password"); err == nil {
+	available, err = c2.CheckHandle("@freshhandle")
+	if err != nil {
+		t.Fatalf("CheckHandle: %v", err)
+	}
+	if available {
+		t.Error("expected @freshhandle to no longer be available after registering it")
+	}
+}
+
+func TestClientLoginWrongPassword(t *testing.T) {
+	addr := startTestServer(t)
+
+	c, err := Dial(addr.String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+	if _, _, _, err := c.Register("@clientbob", "correct horse battery", "", "", ""); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	c.Close()
+
+	c2, err := Dial(addr.String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c2.Close()
+	if _, _, _, err := c2.Login("@clientbob", "wrong password"); err == nil {
 		t.Error("expected Login with the wrong password to fail")
 	}
 }
@@ -56,18 +92,31 @@ func TestClientOrgCreateInviteJoin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial host: %v", err)
 	}
-	defer host.Close()
-	if _, _, err := host.Register("@clienthost", "correct horse battery"); err != nil {
+	if _, _, _, err := host.Register("@clienthost", "correct horse battery", "", "", ""); err != nil {
 		t.Fatalf("Register host: %v", err)
 	}
+	host.Close()
 
 	guest, err := Dial(addr.String())
 	if err != nil {
 		t.Fatalf("Dial guest: %v", err)
 	}
 	defer guest.Close()
-	if _, _, err := guest.Register("@clientguest", "correct horse battery"); err != nil {
+	if _, _, _, err := guest.Register("@clientguest", "correct horse battery", "", "", ""); err != nil {
 		t.Fatalf("Register guest: %v", err)
+	}
+	promoteAdmin(t, "@clienthost")
+
+	// A connection's authenticated User (and its IsAdmin) is a snapshot
+	// taken at auth time -- the promotion above wouldn't reach the
+	// already-closed connection anyway, so reconnect+log in fresh.
+	host, err = Dial(addr.String())
+	if err != nil {
+		t.Fatalf("re-dial host: %v", err)
+	}
+	defer host.Close()
+	if _, _, _, err := host.Login("@clienthost", "correct horse battery"); err != nil {
+		t.Fatalf("Login host: %v", err)
 	}
 
 	org, err := host.CreateOrg("Client Org")
@@ -117,18 +166,31 @@ func TestClientSendRelayDeliversAsEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial alice: %v", err)
 	}
-	defer alice.Close()
-	if _, _, err := alice.Register("@clientalice2", "correct horse battery"); err != nil {
+	if _, _, _, err := alice.Register("@clientalice2", "correct horse battery", "", "", ""); err != nil {
 		t.Fatalf("Register alice: %v", err)
 	}
+	alice.Close()
 
 	bob, err := Dial(addr.String())
 	if err != nil {
 		t.Fatalf("Dial bob: %v", err)
 	}
 	defer bob.Close()
-	if _, _, err := bob.Register("@clientbob2", "correct horse battery"); err != nil {
+	if _, _, _, err := bob.Register("@clientbob2", "correct horse battery", "", "", ""); err != nil {
 		t.Fatalf("Register bob: %v", err)
+	}
+	promoteAdmin(t, "@clientalice2")
+
+	// A connection's authenticated User (and its IsAdmin) is a snapshot
+	// taken at auth time -- reconnect+log in fresh so alice's session
+	// reflects the promotion above.
+	alice, err = Dial(addr.String())
+	if err != nil {
+		t.Fatalf("re-dial alice: %v", err)
+	}
+	defer alice.Close()
+	if _, _, _, err := alice.Login("@clientalice2", "correct horse battery"); err != nil {
+		t.Fatalf("Login alice: %v", err)
 	}
 
 	org, err := alice.CreateOrg("Relay Org")
@@ -167,7 +229,7 @@ func TestClientSendRelayWithoutSharedOrgReportsErrorAsEvent(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer alice.Close()
-	if _, _, err := alice.Register("@lonelyclient", "correct horse battery"); err != nil {
+	if _, _, _, err := alice.Register("@lonelyclient", "correct horse battery", "", "", ""); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -176,7 +238,7 @@ func TestClientSendRelayWithoutSharedOrgReportsErrorAsEvent(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer stranger.Close()
-	if _, _, err := stranger.Register("@strangerclient", "correct horse battery"); err != nil {
+	if _, _, _, err := stranger.Register("@strangerclient", "correct horse battery", "", "", ""); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -21,22 +22,26 @@ const (
 )
 
 // Server accepts relay connections. Before authenticating, a connection can
-// only send MsgAuthRegister/MsgAuthLogin; once authenticated, it's
-// registered with the Hub (so other connections can reach it) and can send
-// MsgRelay and the org_* messages. Presence and relay are scoped to shared
-// organization membership (Phase 3) rather than a flat global roster.
+// only send MsgAuthRegister/MsgAuthLogin/MsgAuthResume/MsgAuthRecoverStart/
+// MsgAuthRecoverFinish; once authenticated, it's registered with the Hub
+// (so other connections can reach it) and can send MsgRelay and the org_*/
+// account_*/unlockable*/avatar_*/todo_* messages. Presence and relay are
+// scoped to shared organization membership (Phase 3) rather than a flat
+// global roster.
 type Server struct {
-	ln   net.Listener
-	auth *Auth
-	orgs *Orgs
-	hub  *Hub
+	ln     net.Listener
+	auth   *Auth
+	orgs   *Orgs
+	points *Points
+	todos  *Todos
+	hub    *Hub
 }
 
 // NewServer binds addr. If tlsConfig is non-nil, the listener is TLS;
 // otherwise it's plain TCP -- the caller (cmd/tiru-server) is responsible
 // for warning loudly about running without TLS, since passwords and
 // session tokens cross this connection.
-func NewServer(addr string, auth *Auth, orgs *Orgs, tlsConfig *tls.Config) (*Server, error) {
+func NewServer(addr string, auth *Auth, orgs *Orgs, points *Points, todos *Todos, tlsConfig *tls.Config) (*Server, error) {
 	var ln net.Listener
 	var err error
 	if tlsConfig != nil {
@@ -47,7 +52,7 @@ func NewServer(addr string, auth *Auth, orgs *Orgs, tlsConfig *tls.Config) (*Ser
 	if err != nil {
 		return nil, fmt.Errorf("relay: listen %s: %w", addr, err)
 	}
-	return &Server{ln: ln, auth: auth, orgs: orgs, hub: NewHub()}, nil
+	return &Server{ln: ln, auth: auth, orgs: orgs, points: points, todos: todos, hub: NewHub()}, nil
 }
 
 // Addr returns the listener's actual bound address (useful when addr was
@@ -157,13 +162,13 @@ func (s *Server) readLoop(ctx context.Context, conn net.Conn, outbox chan<- Enve
 	}
 }
 
-// handlePreAuth handles the only two message types allowed before
-// authentication, returning the now-authenticated User on success (nil on
-// failure or on any other message type).
+// handlePreAuth handles every message type allowed before authentication,
+// returning the now-authenticated User on success (nil on failure, or on
+// any other message type, or on a recovery step that isn't done yet).
 func (s *Server) handlePreAuth(ctx context.Context, env Envelope, outbox chan<- Envelope) *User {
 	switch env.Type {
 	case MsgAuthRegister:
-		if err := s.auth.Register(ctx, env.Handle, env.Password); err != nil {
+		if err := s.auth.Register(ctx, env.Handle, env.Password, env.AvatarASCII, env.SecurityQuestion, env.SecurityAnswer); err != nil {
 			outbox <- Envelope{Type: MsgAuthError, Reason: err.Error()}
 			return nil
 		}
@@ -172,30 +177,71 @@ func (s *Server) handlePreAuth(ctx context.Context, env Envelope, outbox chan<- 
 	case MsgAuthLogin:
 		return s.loginAndJoin(ctx, env.Handle, env.Password, outbox)
 
+	case MsgAuthResume:
+		user, token, expiresAt, err := s.auth.ResumeSession(ctx, env.Token)
+		if err != nil {
+			outbox <- Envelope{Type: MsgAuthError, Reason: err.Error()}
+			return nil
+		}
+		return s.completeJoin(ctx, user, token, expiresAt, outbox)
+
+	case MsgAuthRecoverStart:
+		question, err := s.auth.RecoverStart(ctx, env.Handle)
+		if err != nil {
+			outbox <- Envelope{Type: MsgAuthError, Reason: err.Error()}
+			return nil
+		}
+		outbox <- Envelope{Type: MsgAuthRecoverQuestion, SecurityQuestion: question}
+		// Still not authenticated -- the connection stays in the pre-auth
+		// loop for the MsgAuthRecoverFinish that should follow.
+		return nil
+
+	case MsgAuthRecoverFinish:
+		user, token, expiresAt, err := s.auth.RecoverFinish(ctx, env.Handle, env.SecurityAnswer, env.Password)
+		if err != nil {
+			outbox <- Envelope{Type: MsgAuthError, Reason: err.Error()}
+			return nil
+		}
+		return s.completeJoin(ctx, user, token, expiresAt, outbox)
+
+	case MsgCheckHandle:
+		_, err := s.auth.Lookup(ctx, env.Handle)
+		outbox <- Envelope{Type: MsgHandleCheckResult, Available: errors.Is(err, ErrNotFound)}
+		// Still not authenticated -- stays in the pre-auth loop, same as
+		// MsgAuthRecoverStart.
+		return nil
+
 	default:
 		outbox <- Envelope{Type: MsgError, Reason: "not authenticated"}
 		return nil
 	}
 }
 
-// loginAndJoin authenticates handle/password, registers it with the Hub,
-// and pushes the auth success response followed by presence for whichever
-// of the user's org-mates (across every org they belong to) are currently
-// online -- not a global roster, since Phase 3 scopes visibility to shared
-// organization membership.
+// loginAndJoin authenticates handle/password and finishes joining, same as
+// completeJoin.
 func (s *Server) loginAndJoin(ctx context.Context, handle, password string, outbox chan<- Envelope) *User {
 	user, token, expiresAt, err := s.auth.Login(ctx, handle, password)
 	if err != nil {
 		outbox <- Envelope{Type: MsgAuthError, Reason: err.Error()}
 		return nil
 	}
+	return s.completeJoin(ctx, user, token, expiresAt, outbox)
+}
 
+// completeJoin registers user with the Hub and pushes the auth success
+// response followed by presence for whichever of the user's org-mates
+// (across every org they belong to) are currently online -- not a global
+// roster, since Phase 3 scopes visibility to shared organization
+// membership. Shared by every path that ends in a successful
+// authentication: fresh login, register, resumed session, and a completed
+// password recovery.
+func (s *Server) completeJoin(ctx context.Context, user User, token string, expiresAt time.Time, outbox chan<- Envelope) *User {
 	if err := s.hub.Join(user.Handle, outbox); err != nil {
 		outbox <- Envelope{Type: MsgError, Reason: err.Error()}
 		return nil
 	}
 
-	outbox <- Envelope{Type: MsgAuthToken, Token: token, ExpiresAt: expiresAt}
+	outbox <- Envelope{Type: MsgAuthToken, Token: token, ExpiresAt: expiresAt, IsAdmin: user.IsAdmin}
 
 	if mates, err := s.orgs.MateHandles(ctx, user); err == nil {
 		for _, mate := range mates {
@@ -254,9 +300,109 @@ func (s *Server) handleAuthed(ctx context.Context, env Envelope, user *User, out
 		outbox <- Envelope{Type: MsgOrgJoined, OrgID: org.ID, OrgName: org.Name}
 		s.notifyOrgOfNewMember(ctx, org.ID, user.Handle, outbox)
 
+	case MsgAccountBio:
+		s.handleAccountBio(ctx, user, outbox)
+
+	case MsgUnlockablesList:
+		s.handleUnlockablesList(ctx, user, outbox)
+
+	case MsgUnlockableRedeem:
+		if err := s.points.Redeem(ctx, *user, env.UnlockableID); err != nil {
+			outbox <- Envelope{Type: MsgError, Reason: err.Error()}
+			return
+		}
+		outbox <- Envelope{Type: MsgUnlockableRedeemed, UnlockableID: env.UnlockableID}
+
+	case MsgAvatarSet:
+		if err := s.points.SetActive(ctx, *user, env.UnlockableID); err != nil {
+			outbox <- Envelope{Type: MsgError, Reason: err.Error()}
+			return
+		}
+		outbox <- Envelope{Type: MsgAvatarSetOK}
+
+	case MsgTodoList:
+		todos, err := s.todos.List(ctx, env.OrgID, *user)
+		if err != nil {
+			outbox <- Envelope{Type: MsgError, Reason: err.Error()}
+			return
+		}
+		outbox <- Envelope{Type: MsgTodoListResult, Todos: todos}
+
+	case MsgTodoAdd:
+		todo, err := s.todos.Add(ctx, env.OrgID, *user, env.Text)
+		if err != nil {
+			outbox <- Envelope{Type: MsgError, Reason: err.Error()}
+			return
+		}
+		outbox <- Envelope{Type: MsgTodoAdded, Todo: &todo}
+
+	case MsgTodoComplete:
+		todo, err := s.todos.Complete(ctx, env.OrgID, env.TodoID, *user)
+		if err != nil {
+			outbox <- Envelope{Type: MsgError, Reason: err.Error()}
+			return
+		}
+		outbox <- Envelope{Type: MsgTodoCompleted, TodoID: todo.ID}
+
 	default:
 		outbox <- Envelope{Type: MsgError, Reason: fmt.Sprintf("unknown message type: %q", env.Type)}
 	}
+}
+
+// handleAccountBio answers MsgAccountBio with the caller's own stats. A
+// failure fetching the profile/org list is reported as MsgError rather
+// than silently answering with zero-valued fields, since a genuinely
+// missing profile (shouldn't happen post-registration, but Store keeps it
+// fallible) is worth surfacing rather than masking as "0 points".
+func (s *Server) handleAccountBio(ctx context.Context, user *User, outbox chan<- Envelope) {
+	profile, err := s.points.Profile(ctx, *user)
+	if err != nil {
+		outbox <- Envelope{Type: MsgError, Reason: err.Error()}
+		return
+	}
+	orgs, err := s.orgs.List(ctx, *user)
+	if err != nil {
+		outbox <- Envelope{Type: MsgError, Reason: err.Error()}
+		return
+	}
+	orgNames := make([]string, len(orgs))
+	for i, o := range orgs {
+		orgNames[i] = o.Name
+	}
+	outbox <- Envelope{
+		Type:        MsgAccountBioResult,
+		Handle:      user.Handle,
+		AvatarASCII: profile.AvatarASCII,
+		Points:      profile.Points,
+		OrgNames:    orgNames,
+		CreatedAt:   user.CreatedAt,
+	}
+}
+
+func (s *Server) handleUnlockablesList(ctx context.Context, user *User, outbox chan<- Envelope) {
+	all, unlocked, err := s.points.ListUnlockables(ctx, *user)
+	if err != nil {
+		outbox <- Envelope{Type: MsgError, Reason: err.Error()}
+		return
+	}
+	profile, err := s.points.Profile(ctx, *user)
+	if err != nil {
+		outbox <- Envelope{Type: MsgError, Reason: err.Error()}
+		return
+	}
+	infos := make([]UnlockableInfo, len(all))
+	for i, u := range all {
+		infos[i] = UnlockableInfo{
+			ID:       u.ID,
+			Name:     u.Name,
+			Kind:     u.Kind,
+			AsciiArt: u.AsciiArt,
+			Cost:     u.Cost,
+			Owned:    unlocked[u.ID],
+			Active:   profile.ActiveUnlockableID != nil && *profile.ActiveUnlockableID == u.ID,
+		}
+	}
+	outbox <- Envelope{Type: MsgUnlockablesListResult, Unlockables: infos}
 }
 
 func (s *Server) handleRelay(ctx context.Context, env Envelope, user *User, outbox chan<- Envelope) {
@@ -280,7 +426,11 @@ func (s *Server) handleRelay(ctx context.Context, env Envelope, user *User, outb
 	out := Envelope{Type: MsgRelay, Handle: user.Handle, Body: env.Body}
 	if !s.hub.Send(target, out) {
 		outbox <- Envelope{Type: MsgError, Reason: fmt.Sprintf("%s is not online", target)}
+		return
 	}
+	// Best-effort: a failed point award shouldn't fail (or even be
+	// reported as failing) an otherwise-successful delivery.
+	_ = s.points.AwardMessage(ctx, user.ID)
 }
 
 // notifyOrgOfNewMember tells every already-online member of orgID (other

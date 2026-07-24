@@ -19,6 +19,15 @@ type fakeStore struct {
 	orgMembers map[int64]map[int64]string // orgID -> userID -> role
 	invites    map[string]fakeInvite
 	nextOrgID  int64
+
+	profiles     map[int64]UserProfile
+	unlockables  map[int64]Unlockable
+	nextUnlockID int64
+	unlocks      map[int64]map[int64]bool // userID -> unlockableID -> owned
+
+	todos      map[int64]TodoInfo
+	todoOrgs   map[int64]int64 // todoID -> orgID
+	nextTodoID int64
 }
 
 type fakeSession struct {
@@ -41,7 +50,122 @@ func newFakeStore() *fakeStore {
 		orgs:          make(map[int64]Org),
 		orgMembers:    make(map[int64]map[int64]string),
 		invites:       make(map[string]fakeInvite),
+		profiles:      make(map[int64]UserProfile),
+		unlockables:   make(map[int64]Unlockable),
+		unlocks:       make(map[int64]map[int64]bool),
+		todos:         make(map[int64]TodoInfo),
+		todoOrgs:      make(map[int64]int64),
 	}
+}
+
+func (f *fakeStore) CreateUserProfile(ctx context.Context, userID int64, avatarASCII, securityQuestion, securityAnswerHash string) error {
+	f.profiles[userID] = UserProfile{
+		UserID: userID, AvatarASCII: avatarASCII,
+		SecurityQuestion: securityQuestion, SecurityAnswerHash: securityAnswerHash,
+	}
+	return nil
+}
+
+func (f *fakeStore) ProfileByUserID(ctx context.Context, userID int64) (UserProfile, error) {
+	p, ok := f.profiles[userID]
+	if !ok {
+		return UserProfile{}, ErrNotFound
+	}
+	return p, nil
+}
+
+func (f *fakeStore) AddPoints(ctx context.Context, userID int64, delta int) error {
+	p := f.profiles[userID]
+	p.Points += delta
+	f.profiles[userID] = p
+	return nil
+}
+
+func (f *fakeStore) UpdatePassword(ctx context.Context, userID int64, newPasswordHash string) error {
+	u := f.usersByID[userID]
+	u.PasswordHash = newPasswordHash
+	f.usersByID[u.ID] = u
+	f.usersByHandle[u.Handle] = u
+	return nil
+}
+
+func (f *fakeStore) ListUnlockables(ctx context.Context) ([]Unlockable, error) {
+	var result []Unlockable
+	for _, u := range f.unlockables {
+		result = append(result, u)
+	}
+	return result, nil
+}
+
+func (f *fakeStore) UnlockedIDs(ctx context.Context, userID int64) (map[int64]bool, error) {
+	result := make(map[int64]bool)
+	for id, owned := range f.unlocks[userID] {
+		if owned {
+			result[id] = true
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeStore) RedeemUnlockable(ctx context.Context, userID, unlockableID int64) error {
+	u, ok := f.unlockables[unlockableID]
+	if !ok {
+		return ErrNotFound
+	}
+	if f.unlocks[userID][unlockableID] {
+		return ErrAlreadyUnlocked
+	}
+	p := f.profiles[userID]
+	if p.Points < u.Cost {
+		return ErrInsufficientPoints
+	}
+	p.Points -= u.Cost
+	f.profiles[userID] = p
+	if f.unlocks[userID] == nil {
+		f.unlocks[userID] = make(map[int64]bool)
+	}
+	f.unlocks[userID][unlockableID] = true
+	return nil
+}
+
+func (f *fakeStore) SetActiveUnlockable(ctx context.Context, userID int64, unlockableID *int64) error {
+	p := f.profiles[userID]
+	p.ActiveUnlockableID = unlockableID
+	f.profiles[userID] = p
+	return nil
+}
+
+func (f *fakeStore) IsOrgMember(ctx context.Context, orgID, userID int64) (bool, error) {
+	_, ok := f.orgMembers[orgID][userID]
+	return ok, nil
+}
+
+func (f *fakeStore) CreateTodo(ctx context.Context, orgID, createdByUserID int64, createdByHandle, text string) (TodoInfo, error) {
+	f.nextTodoID++
+	t := TodoInfo{ID: f.nextTodoID, Text: text, CreatedBy: createdByHandle, CreatedAt: time.Now()}
+	f.todos[t.ID] = t
+	f.todoOrgs[t.ID] = orgID
+	return t, nil
+}
+
+func (f *fakeStore) ListTodos(ctx context.Context, orgID int64) ([]TodoInfo, error) {
+	var result []TodoInfo
+	for id, t := range f.todos {
+		if f.todoOrgs[id] == orgID {
+			result = append(result, t)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeStore) CompleteTodo(ctx context.Context, orgID, todoID int64) (TodoInfo, error) {
+	t, ok := f.todos[todoID]
+	if !ok || f.todoOrgs[todoID] != orgID {
+		return TodoInfo{}, ErrNotFound
+	}
+	t.Done = true
+	f.todos[todoID] = t
+	return t, nil
 }
 
 func (f *fakeStore) CreateUser(ctx context.Context, handle, passwordHash string) (User, error) {
@@ -82,6 +206,17 @@ func (f *fakeStore) UserBySessionToken(ctx context.Context, token string) (User,
 
 func (f *fakeStore) DeleteSession(ctx context.Context, token string) error {
 	delete(f.sessions, token)
+	return nil
+}
+
+func (f *fakeStore) PromoteToAdmin(ctx context.Context, handle string) error {
+	u, ok := f.usersByHandle[handle]
+	if !ok {
+		return nil
+	}
+	u.IsAdmin = true
+	f.usersByHandle[handle] = u
+	f.usersByID[u.ID] = u
 	return nil
 }
 
@@ -169,7 +304,7 @@ func TestRegisterAndLoginRoundTrip(t *testing.T) {
 	auth := NewAuth(newFakeStore())
 	ctx := context.Background()
 
-	if err := auth.Register(ctx, "alex", "correct horse"); err != nil {
+	if err := auth.Register(ctx, "alex", "correct horse", "", "", ""); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -201,7 +336,7 @@ func TestRegisterNormalizesHandleWithoutAt(t *testing.T) {
 	auth := NewAuth(store)
 	ctx := context.Background()
 
-	if err := auth.Register(ctx, "alex", "correct horse"); err != nil {
+	if err := auth.Register(ctx, "alex", "correct horse", "", "", ""); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if _, ok := store.usersByHandle["@alex"]; !ok {
@@ -213,10 +348,10 @@ func TestRegisterDuplicateHandleFails(t *testing.T) {
 	auth := NewAuth(newFakeStore())
 	ctx := context.Background()
 
-	if err := auth.Register(ctx, "@alex", "correct horse"); err != nil {
+	if err := auth.Register(ctx, "@alex", "correct horse", "", "", ""); err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
-	err := auth.Register(ctx, "@alex", "a different password")
+	err := auth.Register(ctx, "@alex", "a different password", "", "", "")
 	if err != ErrHandleTaken {
 		t.Errorf("second Register err = %v, want ErrHandleTaken", err)
 	}
@@ -229,7 +364,7 @@ func TestRegisterDuplicateHandleFails(t *testing.T) {
 
 func TestRegisterRejectsShortPassword(t *testing.T) {
 	auth := NewAuth(newFakeStore())
-	if err := auth.Register(context.Background(), "@alex", "short"); err == nil {
+	if err := auth.Register(context.Background(), "@alex", "short", "", "", ""); err == nil {
 		t.Error("expected a short password to be rejected")
 	}
 }
@@ -237,7 +372,7 @@ func TestRegisterRejectsShortPassword(t *testing.T) {
 func TestLoginWrongPasswordFails(t *testing.T) {
 	auth := NewAuth(newFakeStore())
 	ctx := context.Background()
-	_ = auth.Register(ctx, "@alex", "correct horse")
+	_ = auth.Register(ctx, "@alex", "correct horse", "", "", "")
 
 	_, _, _, err := auth.Login(ctx, "@alex", "wrong password")
 	if err != ErrInvalidCredentials {
@@ -257,7 +392,7 @@ func TestAuthenticateRejectsExpiredSession(t *testing.T) {
 	store := newFakeStore()
 	auth := NewAuth(store)
 	ctx := context.Background()
-	_ = auth.Register(ctx, "@alex", "correct horse")
+	_ = auth.Register(ctx, "@alex", "correct horse", "", "", "")
 
 	_, token, _, err := auth.Login(ctx, "@alex", "correct horse")
 	if err != nil {
@@ -283,7 +418,7 @@ func TestAuthenticateRejectsUnknownToken(t *testing.T) {
 func TestLogoutRevokesSession(t *testing.T) {
 	auth := NewAuth(newFakeStore())
 	ctx := context.Background()
-	_ = auth.Register(ctx, "@alex", "correct horse")
+	_ = auth.Register(ctx, "@alex", "correct horse", "", "", "")
 	_, token, _, _ := auth.Login(ctx, "@alex", "correct horse")
 
 	if err := auth.Logout(ctx, token); err != nil {
@@ -297,7 +432,7 @@ func TestLogoutRevokesSession(t *testing.T) {
 func TestPasswordHashIsNeverStoredInPlaintext(t *testing.T) {
 	store := newFakeStore()
 	auth := NewAuth(store)
-	if err := auth.Register(context.Background(), "@alex", "correct horse"); err != nil {
+	if err := auth.Register(context.Background(), "@alex", "correct horse", "", "", ""); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	u := store.usersByHandle["@alex"]
@@ -306,5 +441,136 @@ func TestPasswordHashIsNeverStoredInPlaintext(t *testing.T) {
 	}
 	if len(u.PasswordHash) == 0 {
 		t.Fatal("expected a non-empty password hash")
+	}
+}
+
+func TestRegisterStoresProfile(t *testing.T) {
+	store := newFakeStore()
+	auth := NewAuth(store)
+	ctx := context.Background()
+	if err := auth.Register(ctx, "@alex", "correct horse", "(^_^)", "favorite color?", "Blue"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	u := store.usersByHandle["@alex"]
+	profile, err := store.ProfileByUserID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("ProfileByUserID: %v", err)
+	}
+	if profile.AvatarASCII != "(^_^)" {
+		t.Errorf("AvatarASCII = %q, want %q", profile.AvatarASCII, "(^_^)")
+	}
+	if profile.SecurityQuestion != "favorite color?" {
+		t.Errorf("SecurityQuestion = %q, want %q", profile.SecurityQuestion, "favorite color?")
+	}
+	if profile.SecurityAnswerHash == "Blue" || profile.SecurityAnswerHash == "" {
+		t.Errorf("SecurityAnswerHash looks unhashed or empty: %q", profile.SecurityAnswerHash)
+	}
+}
+
+func TestResumeSessionRotatesTokenAndRevokesOld(t *testing.T) {
+	auth := NewAuth(newFakeStore())
+	ctx := context.Background()
+	_ = auth.Register(ctx, "@alex", "correct horse", "", "", "")
+	_, oldToken, _, _ := auth.Login(ctx, "@alex", "correct horse")
+
+	user, newToken, expiresAt, err := auth.ResumeSession(ctx, oldToken)
+	if err != nil {
+		t.Fatalf("ResumeSession: %v", err)
+	}
+	if user.Handle != "@alex" {
+		t.Errorf("Handle = %q, want %q", user.Handle, "@alex")
+	}
+	if newToken == "" || newToken == oldToken {
+		t.Errorf("expected a fresh, different token, got %q (old was %q)", newToken, oldToken)
+	}
+	if !expiresAt.After(time.Now()) {
+		t.Errorf("expected expiresAt in the future, got %v", expiresAt)
+	}
+	if _, err := auth.Authenticate(ctx, oldToken); err != ErrNotFound {
+		t.Errorf("old token should be revoked after resume, err = %v, want ErrNotFound", err)
+	}
+	if _, err := auth.Authenticate(ctx, newToken); err != nil {
+		t.Errorf("new token should authenticate, got err = %v", err)
+	}
+}
+
+func TestResumeSessionRejectsExpiredToken(t *testing.T) {
+	store := newFakeStore()
+	auth := NewAuth(store)
+	ctx := context.Background()
+	_ = auth.Register(ctx, "@alex", "correct horse", "", "", "")
+	_, token, _, _ := auth.Login(ctx, "@alex", "correct horse")
+	sess := store.sessions[token]
+	sess.expiresAt = time.Now().Add(-time.Minute)
+	store.sessions[token] = sess
+
+	if _, _, _, err := auth.ResumeSession(ctx, token); err != ErrSessionExpired {
+		t.Errorf("err = %v, want ErrSessionExpired", err)
+	}
+}
+
+func TestRecoverStartReturnsQuestion(t *testing.T) {
+	auth := NewAuth(newFakeStore())
+	ctx := context.Background()
+	_ = auth.Register(ctx, "@alex", "correct horse", "", "favorite color?", "blue")
+
+	question, err := auth.RecoverStart(ctx, "@alex")
+	if err != nil {
+		t.Fatalf("RecoverStart: %v", err)
+	}
+	if question != "favorite color?" {
+		t.Errorf("question = %q, want %q", question, "favorite color?")
+	}
+}
+
+func TestRecoverStartRefusesAccountWithoutQuestion(t *testing.T) {
+	auth := NewAuth(newFakeStore())
+	ctx := context.Background()
+	_ = auth.Register(ctx, "@alex", "correct horse", "", "", "")
+
+	if _, err := auth.RecoverStart(ctx, "@alex"); err != ErrNoSecurityQuestion {
+		t.Errorf("err = %v, want ErrNoSecurityQuestion", err)
+	}
+}
+
+func TestRecoverStartUnknownHandle(t *testing.T) {
+	auth := NewAuth(newFakeStore())
+	if _, err := auth.RecoverStart(context.Background(), "@nobody"); err != ErrNotFound {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecoverFinishWrongAnswerFails(t *testing.T) {
+	auth := NewAuth(newFakeStore())
+	ctx := context.Background()
+	_ = auth.Register(ctx, "@alex", "correct horse", "", "favorite color?", "blue")
+
+	if _, _, _, err := auth.RecoverFinish(ctx, "@alex", "red", "new password123"); err != ErrWrongSecurityAnswer {
+		t.Errorf("err = %v, want ErrWrongSecurityAnswer", err)
+	}
+}
+
+func TestRecoverFinishSucceedsCaseInsensitivelyAndLogsIn(t *testing.T) {
+	auth := NewAuth(newFakeStore())
+	ctx := context.Background()
+	_ = auth.Register(ctx, "@alex", "correct horse", "", "favorite color?", "Blue")
+
+	user, token, expiresAt, err := auth.RecoverFinish(ctx, "@alex", "  blue  ", "new password123")
+	if err != nil {
+		t.Fatalf("RecoverFinish: %v", err)
+	}
+	if user.Handle != "@alex" {
+		t.Errorf("Handle = %q, want %q", user.Handle, "@alex")
+	}
+	if token == "" || !expiresAt.After(time.Now()) {
+		t.Errorf("expected a fresh valid session, got token=%q expiresAt=%v", token, expiresAt)
+	}
+
+	// The new password should now work, and the old one shouldn't.
+	if _, _, _, err := auth.Login(ctx, "@alex", "new password123"); err != nil {
+		t.Errorf("Login with new password: %v", err)
+	}
+	if _, _, _, err := auth.Login(ctx, "@alex", "correct horse"); err != ErrInvalidCredentials {
+		t.Errorf("Login with old password should now fail, err = %v", err)
 	}
 }

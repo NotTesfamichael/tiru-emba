@@ -16,8 +16,10 @@ func startTestServer(t *testing.T) net.Addr {
 	store := connectTestStore(t)
 	auth := NewAuth(store)
 	orgs := NewOrgs(store)
+	points := NewPoints(store)
+	todos := NewTodos(store, points)
 
-	srv, err := NewServer("127.0.0.1:0", auth, orgs, nil)
+	srv, err := NewServer("127.0.0.1:0", auth, orgs, points, todos, nil)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -29,12 +31,35 @@ func startTestServer(t *testing.T) net.Addr {
 	return srv.Addr()
 }
 
+// promoteAdmin connects directly to the test database (bypassing the wire
+// protocol entirely -- PromoteToAdmin is operator-only, never exposed to
+// clients) and marks handle as a system admin, without the destructive
+// TRUNCATE connectTestStore does on setup. Tests that need to create an
+// org call this right after registering the handle that'll create it,
+// since only admins may (see Orgs.Create).
+func promoteAdmin(t *testing.T, handle string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	store, err := NewPGStore(ctx, testDBURL())
+	if err != nil {
+		t.Skipf("no reachable Postgres at %s, skipping integration test: %v", testDBURL(), err)
+	}
+	defer store.Close()
+	if err := store.PromoteToAdmin(ctx, NormalizeHandle(handle)); err != nil {
+		t.Fatalf("PromoteToAdmin(%s): %v", handle, err)
+	}
+}
+
 // testConn is a persistent connection to a test server, for tests that
-// exchange more than one message (auth, then relay/presence).
+// exchange more than one message (auth, then relay/presence). handle is
+// set by registerAndAuth, so helpers like createSharedOrg can promote the
+// org-creating connection to admin without the caller passing it again.
 type testConn struct {
-	t    *testing.T
-	conn net.Conn
-	r    *bufio.Reader
+	t      *testing.T
+	conn   net.Conn
+	r      *bufio.Reader
+	handle string
 }
 
 func dial(t *testing.T, addr net.Addr) *testConn {
@@ -99,6 +124,31 @@ func registerAndAuth(t *testing.T, addr net.Addr, handle, password string) *test
 	if resp.Type != MsgAuthToken {
 		t.Fatalf("register resp = %+v, want MsgAuthToken", resp)
 	}
+	c.handle = NormalizeHandle(handle)
+	return c
+}
+
+// registerAdminAndAuth registers handle, promotes it to admin, then logs
+// in on a *fresh* connection -- a connection's authenticated User is a
+// snapshot taken at auth time (see Server.completeJoin), so promoting an
+// already-connected session wouldn't take effect until it reconnects, the
+// same as in production; this mirrors that by registering+closing first,
+// then only handing back a connection made after the promotion.
+func registerAdminAndAuth(t *testing.T, addr net.Addr, handle, password string) *testConn {
+	t.Helper()
+	resp := dialAndRoundTrip(t, addr, Envelope{Type: MsgAuthRegister, Handle: handle, Password: password})
+	if resp.Type != MsgAuthToken {
+		t.Fatalf("register resp = %+v, want MsgAuthToken", resp)
+	}
+	promoteAdmin(t, handle)
+
+	c := dial(t, addr)
+	c.send(Envelope{Type: MsgAuthLogin, Handle: handle, Password: password})
+	loginResp := c.recv()
+	if loginResp.Type != MsgAuthToken {
+		t.Fatalf("login resp = %+v, want MsgAuthToken", loginResp)
+	}
+	c.handle = NormalizeHandle(handle)
 	return c
 }
 
@@ -170,6 +220,35 @@ func TestServerRejectsAnythingBeforeAuth(t *testing.T) {
 	}
 }
 
+func TestCheckHandleAvailableAndTaken(t *testing.T) {
+	addr := startTestServer(t)
+	dialAndRoundTrip(t, addr, Envelope{Type: MsgAuthRegister, Handle: "@handletaken", Password: "correct horse"})
+
+	resp := dialAndRoundTrip(t, addr, Envelope{Type: MsgCheckHandle, Handle: "@handletaken"})
+	if resp.Type != MsgHandleCheckResult || resp.Available {
+		t.Fatalf("resp = %+v, want MsgHandleCheckResult{Available: false}", resp)
+	}
+
+	resp = dialAndRoundTrip(t, addr, Envelope{Type: MsgCheckHandle, Handle: "@handlefree"})
+	if resp.Type != MsgHandleCheckResult || !resp.Available {
+		t.Fatalf("resp = %+v, want MsgHandleCheckResult{Available: true}", resp)
+	}
+}
+
+func TestCheckHandleDoesNotAuthenticateTheConnection(t *testing.T) {
+	addr := startTestServer(t)
+	c := dial(t, addr)
+	c.send(Envelope{Type: MsgCheckHandle, Handle: "@whoever"})
+	c.recv() // the MsgHandleCheckResult itself
+
+	// Still pre-auth -- a real request should still be rejected.
+	c.send(Envelope{Type: MsgOrgList})
+	resp := c.recv()
+	if resp.Type != MsgError || resp.Reason != "not authenticated" {
+		t.Fatalf("resp = %+v, want MsgError %q", resp, "not authenticated")
+	}
+}
+
 func TestServerUnknownMessageTypeOnceAuthed(t *testing.T) {
 	addr := startTestServer(t)
 	c := registerAndAuth(t, addr, "@authed", "correct horse")
@@ -196,10 +275,10 @@ func TestServerMalformedJSONIsIgnoredNotFatal(t *testing.T) {
 	}
 }
 
-// createSharedOrg makes host create an org, invite guest, and have guest
-// redeem that invite -- via the real wire protocol, exactly the way a real
-// client pair would -- establishing the shared org membership presence and
-// relay now require. Returns the new org's ID.
+// createSharedOrg makes host create an org (host must already be
+// authenticated as an admin -- see registerAdminAndAuth), invite guest,
+// and have guest redeem that invite -- via the real wire protocol, exactly
+// the way a real client pair would. Returns the new org's ID.
 func createSharedOrg(t *testing.T, host, guest *testConn) int64 {
 	t.Helper()
 	host.send(Envelope{Type: MsgOrgCreate, OrgName: "Test Org"})
@@ -225,7 +304,7 @@ func createSharedOrg(t *testing.T, host, guest *testConn) int64 {
 
 func TestPresenceBroadcastsOrgJoinToOthersAlreadyOnline(t *testing.T) {
 	addr := startTestServer(t)
-	first := registerAndAuth(t, addr, "@first", "correct horse")
+	first := registerAdminAndAuth(t, addr, "@first", "correct horse")
 	second := registerAndAuth(t, addr, "@second", "correct horse")
 
 	// @second joining the org first created is exactly the moment @first
@@ -240,7 +319,7 @@ func TestPresenceBroadcastsOrgJoinToOthersAlreadyOnline(t *testing.T) {
 
 func TestPresenceSeedsExistingRosterOnReconnect(t *testing.T) {
 	addr := startTestServer(t)
-	first := registerAndAuth(t, addr, "@first", "correct horse")
+	first := registerAdminAndAuth(t, addr, "@first", "correct horse")
 	second := registerAndAuth(t, addr, "@second", "correct horse")
 	createSharedOrg(t, first, second)
 	first.recvUntil(MsgPresenceJoined) // drain @second's org-join notification
@@ -263,7 +342,7 @@ func TestPresenceSeedsExistingRosterOnReconnect(t *testing.T) {
 
 func TestPresenceBroadcastsLeaveOnDisconnect(t *testing.T) {
 	addr := startTestServer(t)
-	first := registerAndAuth(t, addr, "@first", "correct horse")
+	first := registerAdminAndAuth(t, addr, "@first", "correct horse")
 	second := registerAndAuth(t, addr, "@second", "correct horse")
 	createSharedOrg(t, first, second)
 	first.recvUntil(MsgPresenceJoined) // drain @second's org-join notification
@@ -290,7 +369,7 @@ func TestJoinRejectsSecondConnectionForSameHandle(t *testing.T) {
 
 func TestRelayDeliversMessageBetweenTwoAuthedUsers(t *testing.T) {
 	addr := startTestServer(t)
-	alice := registerAndAuth(t, addr, "@alice", "correct horse")
+	alice := registerAdminAndAuth(t, addr, "@alice", "correct horse")
 	bob := registerAndAuth(t, addr, "@bob", "correct horse")
 	createSharedOrg(t, alice, bob)
 	alice.recvUntil(MsgPresenceJoined) // drain @bob's org-join notification
@@ -308,7 +387,7 @@ func TestRelayDeliversMessageBetweenTwoAuthedUsers(t *testing.T) {
 
 func TestRelayToOfflineHandleReportsError(t *testing.T) {
 	addr := startTestServer(t)
-	alice := registerAndAuth(t, addr, "@alice-alone", "correct horse")
+	alice := registerAdminAndAuth(t, addr, "@alice-alone", "correct horse")
 	offline := registerAndAuth(t, addr, "@offline-guy", "correct horse")
 	createSharedOrg(t, alice, offline)
 	alice.recvUntil(MsgPresenceJoined)
@@ -337,7 +416,7 @@ func TestRelayBlockedWithoutSharedOrg(t *testing.T) {
 
 func TestRelaySenderCannotSpoofFromHandle(t *testing.T) {
 	addr := startTestServer(t)
-	alice := registerAndAuth(t, addr, "@realalice", "correct horse")
+	alice := registerAdminAndAuth(t, addr, "@realalice", "correct horse")
 	bob := registerAndAuth(t, addr, "@bob2", "correct horse")
 	createSharedOrg(t, alice, bob)
 	alice.recvUntil(MsgPresenceJoined)
@@ -354,7 +433,7 @@ func TestRelaySenderCannotSpoofFromHandle(t *testing.T) {
 
 func TestOrgCreateAndList(t *testing.T) {
 	addr := startTestServer(t)
-	c := registerAndAuth(t, addr, "@founder", "correct horse")
+	c := registerAdminAndAuth(t, addr, "@founder", "correct horse")
 
 	c.send(Envelope{Type: MsgOrgCreate, OrgName: "Acme"})
 	created := c.recvUntil(MsgOrgCreated)
@@ -371,7 +450,7 @@ func TestOrgCreateAndList(t *testing.T) {
 
 func TestOrgCreateRejectsEmptyName(t *testing.T) {
 	addr := startTestServer(t)
-	c := registerAndAuth(t, addr, "@founder2", "correct horse")
+	c := registerAdminAndAuth(t, addr, "@founder2", "correct horse")
 
 	c.send(Envelope{Type: MsgOrgCreate, OrgName: "   "})
 	resp := c.recv()
@@ -380,9 +459,20 @@ func TestOrgCreateRejectsEmptyName(t *testing.T) {
 	}
 }
 
+func TestOrgCreateRejectsNonAdmin(t *testing.T) {
+	addr := startTestServer(t)
+	c := registerAndAuth(t, addr, "@notadmin", "correct horse")
+
+	c.send(Envelope{Type: MsgOrgCreate, OrgName: "Acme"})
+	resp := c.recv()
+	if resp.Type != MsgError {
+		t.Fatalf("resp = %+v, want MsgError (not an admin)", resp)
+	}
+}
+
 func TestOrgJoinFullFlow(t *testing.T) {
 	addr := startTestServer(t)
-	host := registerAndAuth(t, addr, "@host-user", "correct horse")
+	host := registerAdminAndAuth(t, addr, "@host-user", "correct horse")
 	guest := registerAndAuth(t, addr, "@guest-user", "correct horse")
 
 	orgID := createSharedOrg(t, host, guest)
@@ -396,7 +486,7 @@ func TestOrgJoinFullFlow(t *testing.T) {
 
 func TestOrgInviteRequiresAdmin(t *testing.T) {
 	addr := startTestServer(t)
-	host := registerAndAuth(t, addr, "@admin-user", "correct horse")
+	host := registerAdminAndAuth(t, addr, "@admin-user", "correct horse")
 	member := registerAndAuth(t, addr, "@plain-member", "correct horse")
 	orgID := createSharedOrg(t, host, member)
 	host.recvUntil(MsgPresenceJoined)   // drain @member's join notification on host's connection
@@ -421,7 +511,7 @@ func TestOrgJoinRejectsInvalidCode(t *testing.T) {
 
 func TestOrgJoinRejectsAlreadyMember(t *testing.T) {
 	addr := startTestServer(t)
-	host := registerAndAuth(t, addr, "@host-user2", "correct horse")
+	host := registerAdminAndAuth(t, addr, "@host-user2", "correct horse")
 	guest := registerAndAuth(t, addr, "@guest-user2", "correct horse")
 	orgID := createSharedOrg(t, host, guest)
 	host.recvUntil(MsgPresenceJoined)

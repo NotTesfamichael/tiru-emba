@@ -1,6 +1,8 @@
 // Package config persists small pieces of local client configuration --
-// currently just the registered handle -- to ~/.tiru-emba/config.json, so a
-// returning user doesn't have to pass --handle on every run.
+// the registered handle, relay server settings, a resumable session token,
+// and the last-known network status -- to ~/.tiru-emba/config.json, so a
+// returning user doesn't have to pass --handle (or log in from scratch) on
+// every run.
 package config
 
 import (
@@ -8,11 +10,33 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Config is the on-disk configuration format.
 type Config struct {
 	Handle string `json:"handle"`
+
+	// ServerURL is the last --server address used, persisted the same way
+	// Handle is so a returning user doesn't have to retype it.
+	ServerURL string `json:"server_url,omitempty"`
+	// LANStatus and WLANStatus reflect live network state as of the last
+	// run ("connected"/"disconnected"): LANStatus for local UDP/TCP
+	// discovery, WLANStatus for the relay/server connection specifically.
+	// Written back after startup, not read as input.
+	LANStatus  string `json:"lan_status,omitempty"`
+	WLANStatus string `json:"wlan_status,omitempty"`
+
+	// BackgroundNotification persists the --background-notification flag
+	// so it doesn't need to be passed on every run.
+	BackgroundNotification bool `json:"background_notification"`
+
+	// SessionToken/SessionExpiresAt let a relay login be resumed
+	// automatically on the next launch instead of prompting for a
+	// password again -- org selection is still always required afresh,
+	// regardless of whether the session itself was resumed.
+	SessionToken     string    `json:"session_token,omitempty"`
+	SessionExpiresAt time.Time `json:"session_expires_at,omitempty"`
 }
 
 func path() (string, error) {
@@ -43,6 +67,18 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: parse %s: %w", p, err)
 	}
 	return c, nil
+}
+
+// Update loads the existing config (if any), applies mutate, and saves the
+// result -- so persisting just one setting never clobbers the others the
+// way overwriting with a freshly zero-valued Config{} would.
+func Update(mutate func(*Config)) error {
+	c, err := Load()
+	if err != nil {
+		return err
+	}
+	mutate(&c)
+	return Save(c)
 }
 
 // Save persists c, registering it for future runs.

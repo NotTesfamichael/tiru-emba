@@ -23,8 +23,14 @@ func NewOrgs(store Store) *Orgs {
 	return &Orgs{store: store}
 }
 
-// Create makes a new org with owner as its first member and admin.
+// Create makes a new org with owner as its first member and (per-org)
+// admin. Only a system admin (owner.IsAdmin, a separate, coarser concept
+// from per-org admin -- see User.IsAdmin) may create one at all; everyone
+// else can only join an existing org via an invite code.
 func (o *Orgs) Create(ctx context.Context, name string, owner User) (Org, error) {
+	if !owner.IsAdmin {
+		return Org{}, ErrNotSystemAdmin
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return Org{}, fmt.Errorf("relay: org name is required")
