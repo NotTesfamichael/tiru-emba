@@ -50,7 +50,16 @@ jobs:
         with:
           distribution: goreleaser
           version: latest
-          args: release --clean ${{ steps.skip.outputs.flags != '' && format('--skip={0}', steps.skip.outputs.flags) || '' }}
+          # --parallelism=1 serializes the cross-compile targets: builds
+          # were intermittently failing with a bogus "undefined:
+          # syscall.SO_REUSEPORT" for a Windows target (a file guarded by
+          # //go:build !windows, so it should never even be compiled for
+          # GOOS=windows) that never reproduces locally under a plain
+          # sequential `go build` -- pointing at a race in how GoReleaser
+          # sets GOOS/GOARCH across concurrently-running build goroutines,
+          # not a real code issue. Serializing is slower but removes the
+          # race entirely.
+          args: release --clean --parallelism=1 ${{ steps.skip.outputs.flags != '' && format('--skip={0}', steps.skip.outputs.flags) || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # PAT with `repo` scope on github.com/NotTesfamichael/homebrew-tiru-emba.
